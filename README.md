@@ -1,0 +1,85 @@
+# Agent Runtime Platform
+
+에이전트의 정의부터 실행, 도구 호출, 메모리, 복구, 추적까지 담당하는 엔터프라이즈급 런타임 포트폴리오 프로젝트입니다.
+
+> 현재 상태: 프로젝트 설계용 README만 있는 초기 저장소
+
+## 목표
+
+- 서버나 워커 장애 후에도 중단된 실행을 안전하게 이어갑니다.
+- 외부 부작용이 있는 도구 호출의 중복 실행을 방지합니다.
+- 모든 실행을 `run → step → model call → tool call → result` 단위로 추적합니다.
+- 테넌트별 권한, 한도, 비용, 데이터 보존 정책을 분리합니다.
+
+## 책임 범위
+
+| 영역 | 책임 |
+| --- | --- |
+| Control Plane | 에이전트 정의·버전·모델 정책·도구 권한·배포 상태 |
+| Runtime | 상태 전이, 스텝 스케줄링, 병렬 실행, 중단·재개 |
+| Tool Gateway | 스키마 검증, 인증, 승인, timeout, 감사 로그 |
+| Memory | 단기·장기 메모리, 출처, TTL, 사용자·테넌트 격리 |
+| Observability | trace 연결, 실패 재현, 민감정보 마스킹 |
+| Governance | quota, rate limit, 실행 예산, 무한 루프 방지 |
+
+## 핵심 지표
+
+- 실행 성공률 및 장애 후 복구율
+- 중복 도구 실행률
+- P95 실행 지연시간
+- trace 누락률
+- 실행당 토큰·도구 비용
+
+## 업무 백로그
+
+### 1. 실행 코어
+
+- [ ] 실행 상태 머신과 전이 규칙 정의
+- [ ] PostgreSQL 기반 event/run store 설계
+- [ ] worker lease, heartbeat, 작업 인계 구현
+- [ ] streaming, cancellation, backpressure 처리
+
+### 2. Durable Execution
+
+- [ ] checkpoint와 resume 구현
+- [ ] retry, exponential backoff, dead-letter queue 구현
+- [ ] idempotency key와 도구 실행 원장 설계
+- [ ] 외부 부작용 실패 시 조회·보상 전략 작성
+
+### 3. Tool Gateway와 보안
+
+- [ ] JSON Schema 기반 입력·출력 검증
+- [ ] 도구별 권한 scope와 human approval 구현
+- [ ] secret 전달 및 외부 네트워크 정책 정의
+- [ ] sandbox 실행과 감사 로그 구현
+
+### 4. Memory와 멀티테넌시
+
+- [ ] 사용자·조직별 메모리 격리
+- [ ] 출처, 갱신 시점, TTL, 삭제 정책 구현
+- [ ] tenant별 quota, rate limit, 비용 집계
+
+### 5. 추적과 품질 운영
+
+- [ ] OpenTelemetry 기반 run trace 연결
+- [ ] prompt/model/tool 버전 기록
+- [ ] redaction, sampling, retention 정책 구현
+- [ ] 실패 trace를 회귀 평가 데이터셋으로 전환
+
+## 마일스톤
+
+| 단계 | 결과물 |
+| --- | --- |
+| M1 | 단일 워커에서 실행·도구 호출·상태 저장 |
+| M2 | 워커 강제 종료 후 복구 및 중복 실행 방지 |
+| M3 | trace viewer, 취소, timeout, DLQ |
+| M4 | 멀티테넌시, 비용·quota, 보안 정책 |
+| M5 | 실패 재실행과 배포 전 회귀 평가 |
+
+## 완료 기준
+
+- 워커 강제 종료 시나리오에서 실행이 유실 없이 복구됩니다.
+- 동일 idempotency key의 외부 도구 호출이 한 번만 반영됩니다.
+- 하나의 run을 입력부터 결과까지 trace로 재구성할 수 있습니다.
+- 테넌트 간 데이터·권한·비용이 분리됨을 자동 테스트로 증명합니다.
+

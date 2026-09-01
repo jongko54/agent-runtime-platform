@@ -4,10 +4,14 @@
 
 > 현재 상태: 프로젝트 설계용 README만 있는 초기 저장소
 
+## 설계 문서
+
+- [Agent Runtime Platform 엔터프라이즈 설계](docs/architecture/agent-runtime-platform.md)
+
 ## 목표
 
 - 서버나 워커 장애 후에도 중단된 실행을 안전하게 이어갑니다.
-- 외부 부작용이 있는 도구 호출의 중복 실행을 방지합니다.
+- provider의 idempotency 계약 안에서 도구 중복 효과를 방지하고, 결과가 불명확하면 자동 재시도 대신 조정 절차로 전환합니다.
 - 모든 실행을 `run → step → model call → tool call → result` 단위로 추적합니다.
 - 테넌트별 권한, 한도, 비용, 데이터 보존 정책을 분리합니다.
 
@@ -79,6 +83,6 @@
 ## 완료 기준
 
 - 워커 강제 종료 시나리오에서 실행이 유실 없이 복구됩니다.
-- 동일 idempotency key의 외부 도구 호출이 한 번만 반영됩니다.
+- idempotency를 지원하는 provider에서는 같은 effect가 중복 반영되지 않고, 지원하지 않는 provider의 불명확한 결과는 `OUTCOME_UNKNOWN`으로 격리됩니다.
 - 하나의 run을 입력부터 결과까지 trace로 재구성할 수 있습니다.
 - 테넌트 간 데이터·권한·비용이 분리됨을 자동 테스트로 증명합니다.

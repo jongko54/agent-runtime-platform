@@ -1,8 +1,8 @@
 # Agent Runtime Platform 엔터프라이즈 설계
 
-- 문서 상태: 구현 전 검토안
+- 문서 상태: 구현 전 기준안
 - 작성일: 2026-09-02
-- 대상 범위: 최소 Agent Runtime → 실행 신뢰성 → 추적·평가 → Model/Tool/Memory Gateway
+- 대상 범위: 멀티테넌트 Control Plane → 최소 Agent Runtime → 실행 신뢰성 → 추적·평가 → Model/Tool/Memory Gateway
 - 기준 배포: 초기 Docker Compose, 이후 Kubernetes로 이전
 
 ## 1. 결론
@@ -21,6 +21,7 @@
 8. **agent, prompt, model policy, tool schema, authorization policy를 불변 버전으로 고정해 모든 Run을 재구성할 수 있게 한다.**
 9. **원문 prompt·응답·tool 인자는 trace에 기본 저장하지 않는다. metadata와 암호화된 content reference를 분리한다.**
 10. **자동 복구가 불가능한 외부 부작용은 실패로 단정하지 않고 `OUTCOME_UNKNOWN`으로 격리해 reconciliation 또는 사람의 판단으로 해결한다.**
+11. **플랫폼 코어는 업무 중립적으로 유지하고, AI 모델 평가·배포는 Agent Definition과 Tool로 구성한 첫 번째 예제 패키지로 분리한다.**
 
 이 구조의 목적은 Temporal이나 대규모 event platform을 다시 만드는 것이 아니다. 에이전트 실행에서 반드시 이해해야 하는 상태 전이, lease, checkpoint, 재시도, idempotency, 정책 집행, 추적을 제한된 범위에서 직접 구현하는 것이다.
 
@@ -191,7 +192,7 @@ flowchart LR
 
 | 모듈 | 책임 | 초기 배포 |
 | --- | --- | --- |
-| Identity Context | 인증 결과에서 tenant, user, workload identity 생성 | API |
+| Identity Context | 인증 결과에서 tenant, project, principal, workload identity 생성 | API |
 | Definition Registry | agent·prompt·model/tool/policy 불변 버전 | API |
 | Run API | 생성, 조회, stream, cancel, approve/reject | API |
 | Workflow Kernel | 상태 머신, budget, next-step 결정 | worker |
@@ -205,6 +206,59 @@ flowchart LR
 
 처음에는 API와 worker 두 프로세스만 운영한다. Tool Gateway를 네트워크 서비스로 분리하는 시점은 독립 보안 경계, 별도 scaling, 다수 runtime의 공용 사용이 실제 요구될 때다.
 
+### 5.2 플랫폼 코어와 업무 패키지 경계
+
+플랫폼 코어는 범용 실행 기반만 소유한다. `Evaluation`, `Benchmark`, `Model Registry`, `Canary Deployment`는 코어 entity나 Step type이 아니라 등록된 Tool의 이름과 입출력 계약으로 표현한다.
+
+```mermaid
+flowchart TB
+    subgraph Core[범용 멀티테넌트 Agent Platform]
+        Tenant[Tenant / Project / Membership]
+        Definition[Agent / Tool Version Registry]
+        Runtime[Durable Runtime]
+        Governance[Approval / Policy / Quota]
+        Evidence[Run / Step / Attempt / Trace / Audit]
+        Gateway[Model / Tool / Memory Ports]
+    end
+
+    subgraph Example[첫 번째 AI 업무 패키지]
+        ReleaseAgent[AI Model Release Agent]
+        EvalTool[Evaluation Tool]
+        BenchmarkTool[Inference Benchmark Tool]
+        RegistryTool[Model Registry Tool]
+        DeployTool[Deployment Tool]
+    end
+
+    subgraph Future[추가 가능한 업무 패키지]
+        DataAgent[Training Data Curation Agent]
+        IncidentAgent[Inference Incident Agent]
+        SupportAgent[Customer Support Agent]
+    end
+
+    ReleaseAgent --> Definition
+    EvalTool --> Gateway
+    BenchmarkTool --> Gateway
+    RegistryTool --> Gateway
+    DeployTool --> Gateway
+    Definition --> Runtime
+    Runtime --> Governance
+    Runtime --> Evidence
+    Runtime --> Gateway
+    DataAgent --> Definition
+    IncidentAgent --> Definition
+    SupportAgent --> Definition
+```
+
+경계 규칙은 다음과 같다.
+
+- AI 모델 릴리스 패키지를 설치하지 않아도 플랫폼의 생성·실행·복구·추적 기능은 모두 동작해야 한다.
+- 업무 패키지는 코어 table이나 상태 enum을 추가하지 않고 Agent Definition, Tool Version, Connection으로만 설치한다.
+- `EVALUATION`, `BENCHMARK`, `CANARY_DEPLOYMENT` 같은 업무 동작은 `TOOL_CALL` Step의 tool identity로 표현한다.
+- Phase 1의 공개 Step kind는 `MODEL_CALL`, `TOOL_CALL`로 제한하고, `APPROVAL`은 Phase 4의 정책 집행과 함께 활성화한다.
+- durable timer가 검증된 뒤 `WAIT`를 추가하고, child Run의 권한·취소·비용 전파 계약이 정해질 때까지 `CHILD_AGENT`는 지원하지 않는다.
+- `SYSTEM` 같은 포괄적 Step kind를 두지 않고 내부 제어 변화는 versioned Run Event로 기록한다.
+- 업무별 adapter는 Gateway port를 구현하며 workflow kernel이나 Run projection을 직접 변경할 수 없다.
+
 ## 6. 실행 데이터 모델
 
 ### 6.1 핵심 entity
@@ -212,9 +266,16 @@ flowchart LR
 | Entity | 핵심 필드 | 규칙 |
 | --- | --- | --- |
 | `tenants` | `id, status, policy_set_id` | 모든 업무 데이터의 최상위 scope |
-| `agent_definitions` | `id, tenant_id, name` | 이름과 소유권 |
-| `agent_versions` | `id, tenant_id, definition_id, version, digest, spec` | publish 후 불변 |
-| `runs` | `id, tenant_id, agent_version_id, state, state_version, deadline_at` | 현재 projection |
+| `projects` | `id, tenant_id, name, status` | Agent·Tool·Run의 업무 경계 |
+| `principals` | `id, tenant_id, issuer, subject, type, status` | 외부 IdP의 user/workload subject 매핑, credential 저장 금지 |
+| `project_memberships` | `tenant_id, project_id, principal_id, role_set_id, status` | Project 접근 권한, 복합 FK로 tenant 일치 강제 |
+| `connections` | `id, tenant_id, project_id, kind, config_ref, credential_ref, status` | provider 연결 metadata, secret은 외부 secret manager 참조만 저장 |
+| `agent_definitions` | `id, tenant_id, project_id, name` | 업무 중립적인 이름과 소유권 |
+| `agent_versions` | `id, tenant_id, project_id, definition_id, version, digest, spec` | publish 후 불변 |
+| `tool_definitions` | `id, tenant_id, project_id, name` | Tool identity와 소유권 |
+| `tool_versions` | `id, tenant_id, project_id, definition_id, version, schema_digest, risk_tier` | 입력·출력 schema와 실행 contract, publish 후 불변 |
+| `policy_versions` | `id, tenant_id, project_id, version, digest, spec` | authorization·budget·approval 정책 snapshot |
+| `runs` | `id, tenant_id, project_id, agent_version_id, state, state_version, deadline_at` | 현재 projection |
 | `run_steps` | `id, tenant_id, run_id, ordinal, kind, state, attempt_count` | 논리 실행 단위 |
 | `run_attempts` | `id, tenant_id, step_id, attempt_no, lease_token, started_at, ended_at` | 물리 실행 시도 |
 | `run_events` | `tenant_id, run_id, sequence, schema_version, type, actor, payload_ref, occurred_at` | append-only, `UNIQUE(tenant_id, run_id, sequence)` |
@@ -226,8 +287,8 @@ flowchart LR
 | `work_items` | `id, tenant_id, run_id, step_id, available_at, priority, lease_token, lease_expires_at` | authoritative queue |
 | `idempotency_records` | `tenant_id, scope, key, request_hash, response_ref, expires_at` | key 재사용 충돌 방지 |
 | `outbox_events` | `id, tenant_id, aggregate_id, type, payload_ref, published_at` | 외부 broker 추가 시 사용 |
-| `usage_entries` | `id, tenant_id, run_id, step_id, source, quantity, unit, cost` | append-only 비용 원장 |
-| `audit_events` | `event_id, tenant_id, sequence, server_time, actor, subject, action, target, decision_id, result, trace_id, prev_hash, event_hash` | 별도 보안 보존 정책 |
+| `usage_entries` | `id, tenant_id, project_id, run_id, step_id, source, quantity, unit, cost` | append-only 비용 원장 |
+| `audit_events` | `event_id, tenant_id, project_id?, sequence, server_time, actor, subject, action, target, decision_id, result, trace_id, prev_hash, event_hash` | tenant 또는 Project 범위의 별도 보안 보존 정책 |
 
 ### 6.2 저장 전략
 
@@ -240,7 +301,11 @@ flowchart LR
 - `run_events`는 실행 복구와 감사의 입력이지만, 보안 audit ledger를 대신하지 않는다.
 - 삭제 요청은 Run만 지우지 않고 checkpoint, content, memory, embedding, cache, evaluation 후보까지 추적해 처리한다.
 
-모든 tenant 소유 실행 table은 직접 `tenant_id`를 가지며 `(tenant_id, id)` unique key와 composite foreign key로 연결한다. tenant 없는 자식 row가 생성되거나 다른 tenant 부모를 참조하는 것을 database constraint로 차단한다.
+모든 tenant 소유 실행 table은 직접 `tenant_id`를 가진다. surrogate ID가 있는 table에는 `(tenant_id, id)` unique key를 두고, 관계는 tenant를 포함한 composite foreign key로 연결한다. Project 소유 최상위 entity는 `project_id`도 직접 가지며 `(tenant_id, project_id)` 관계를 검증한다. tenant 없는 자식 row가 생성되거나 다른 tenant 부모를 참조하는 것을 database constraint로 차단한다.
+
+인증과 계정 lifecycle의 권위는 외부 identity provider에 둔다. `principals`는 인증서·비밀번호를 보관하는 사용자 table이 아니라 검증된 issuer와 subject를 로컬 권한에 매핑하는 projection이다. `connections`에도 credential 원문을 넣지 않고 Tool Gateway가 실행 직전에 해석할 수 있는 secret reference만 저장한다.
+
+Project는 Tenant 안의 협업·권한·비용 경계다. Run 생성 시 서버는 인증된 principal의 활성 membership을 확인해 `tenant_id`와 `project_id`를 결정하며, 클라이언트가 임의로 보낸 scope를 신뢰하지 않는다. 실행 자식 row는 Run의 scope와 다른 Project를 참조할 수 없다.
 
 ## 7. Run과 Step 상태 머신
 
@@ -612,9 +677,12 @@ Content-Type: application/json
 
 응답은 durable commit 이후에만 반환한다.
 
+서버는 `agent_version_id`의 소유 Project와 인증된 principal의 활성 Membership을 대조해 실행 scope를 결정한다. `tenant_id`나 `project_id`를 request body로 받아 권한 판단에 사용하지 않는다.
+
 ```json
 {
   "run_id": "run_01...",
+  "project_id": "project_01...",
   "state": "QUEUED",
   "agent_version_id": "av_01...",
   "created_at": "2026-09-01T00:00:00Z"
@@ -684,16 +752,18 @@ system prompt에 secret이나 authorization 규칙을 넣지 않는다. model이
 - egress는 default deny이며 승인된 proxy와 destination allowlist를 통과한다.
 - localhost, private/link-local network, cloud metadata endpoint, DNS rebinding을 차단한다.
 
-### 13.5 tenant 격리
+### 13.5 Tenant·Project 격리
 
 - `tenant_id`는 인증 결과에서 생성하고 모든 DB row, cache key, object path, queue reference, trace, memory에 강제한다.
+- `project_id`는 Agent Version의 소유 Project와 활성 Membership에서 결정하며 request body의 임의 scope를 권한 근거로 사용하지 않는다.
+- Agent·Tool·Policy·Connection·Run의 Project 관계는 application authorization과 composite foreign key로 모두 검증한다.
 - 애플리케이션 query 조건에 더해 PostgreSQL Row-Level Security를 두 번째 방어층으로 사용한다.
 - 일반 application DB role은 `BYPASSRLS`나 table owner 권한을 갖지 않는다.
 - global dispatcher는 payload를 읽을 수 없는 전용 no-login owner의 `SECURITY DEFINER` claim function만 호출한다. 함수는 제한된 work metadata와 tenant ID를 반환하며 `search_path`를 고정하고 호출자 입력으로 임의 SQL을 만들지 않는다.
 - worker는 claim 후 각 transaction에서 `SET LOCAL app.tenant_id`를 설정하고 해당 tenant RLS 아래에서 실행 데이터를 읽고 쓴다. dispatcher 권한을 workflow나 tool 실행에 전달하지 않는다.
 - cache/vector index는 tenant query filter를 강제하고 고감도 tenant는 별도 namespace·key·index를 사용한다.
 - quota, concurrency, token, cost budget을 tenant 단위로 집행한다.
-- 다른 tenant의 run ID·queue message·cache key·trace를 대입하는 canary test를 CI에 둔다.
+- 다른 Tenant 또는 같은 Tenant의 권한 없는 Project에 속한 run ID·connection·approval token·queue message·cache key·trace를 대입하는 canary test를 CI에 둔다.
 
 ### 13.6 보안 감사 원장
 
@@ -723,6 +793,8 @@ HTTP POST /v1/runs
 물리 retry마다 새 span을 만들고 durable 식별자로 연결한다.
 
 - `agent.platform.run.id`
+- `agent.platform.tenant.id_hash`
+- `agent.platform.project.id_hash`
 - `agent.platform.step.id`
 - `agent.platform.attempt.number`
 - `agent.platform.lease.id`
@@ -919,7 +991,7 @@ Kubernetes 자체를 도입하는 것이 reliability 증거가 아니다. node d
 | provider 조회 불가 tool | dispatch 직후 연결을 100회 끊음 | 자동 retry=0, 모든 Effect가 `OUTCOME_UNKNOWN` |
 | lease가 만료된 worker | 새 worker 완료 후 이전 worker 1,000회 commit 경합 | stale projection update=0 |
 | cancel 가능한 Run | cancel과 Effect dispatch CAS를 각각 500회 경합 | cancel commit 이후 새 `DISPATCHED` transition=0, 먼저 commit된 dispatch는 모두 in-flight로 분류 |
-| 두 tenant와 임의 ID | 10,000회 교차 조회·수정·approval replay | 성공=0, audit 누락=0 |
+| 두 Tenant와 동일 Tenant 내 두 Project의 임의 ID | 10,000회 교차 조회·수정·approval replay | 권한 없는 성공=0, audit 누락=0 |
 | 32 worker, 10,000 ready work items | 50 items/s로 30분 처리 | p95 dispatch≤2초, event gap=0, duplicate projection=0 |
 | trace exporter 중단 | critical Run 1,000건 실행 | 실행 성공 경로 비차단, drop metric·alert 발생 |
 | queue/broker 전체 유실 | reconciler 재시작 | PostgreSQL pending work에서 누락 없이 재구성 |
@@ -934,6 +1006,8 @@ event oracle은 각 Run의 sequence가 1부터 연속이고 projection version�
 
 산출물:
 
+- 플랫폼 코어와 업무 패키지의 의존 방향
+- Tenant·Project·Principal·Membership·Connection contract
 - 상태 머신과 error taxonomy
 - database schema와 transaction boundary
 - Model/Tool/Memory port
@@ -942,6 +1016,8 @@ event oracle은 각 Run의 sequence가 1부터 연속이고 projection version�
 
 종료 조건:
 
+- AI 업무 패키지 제거 후에도 코어 contract가 완전함
+- 인증 subject, Tenant, Project, Membership의 권한 결정 경계가 명시됨
 - 모든 상태 전이에 단일 소유자와 transaction이 지정됨
 - tool crash window별 복구 정책이 결정됨
 - 모든 요구가 구체적인 상태, 소유자, transaction, 검증 조건으로 표현됨
@@ -950,16 +1026,20 @@ event oracle은 각 Run의 sequence가 1부터 연속이고 projection version�
 
 범위:
 
+- Tenant·Project·Principal·Membership 최소 Control Plane
 - agent/version 등록
+- tool/version과 mock Connection 등록
 - Run/Step/Event 저장
 - mock/API model
 - 단일 structured tool
+- AI 모델 릴리스 예제의 후보 조회 → mock model 판단 → mock 평가 → 결과 저장 경로
 - REST와 SSE
 - 단일 worker
 
 종료 조건:
 
 - 요청 → model 판단 → tool 실행 → 결과 저장 한 사이클
+- 업무 전용 entity나 Step kind 없이 예제 패키지가 등록됨
 - 모든 결과에서 고정 version과 event sequence 조회 가능
 
 ### Phase 2 — 실행 신뢰성
@@ -975,6 +1055,7 @@ event oracle은 각 Run의 sequence가 1부터 연속이고 projection version�
 종료 조건:
 
 - 필수 crash matrix 통과
+- AI 모델 릴리스 mock Tool의 완료 직후 worker kill과 중복 전달 시나리오 통과
 - stale worker가 projection을 변경하지 못함
 - provider 지원 범위에서 중복 effect가 방지됨
 - 지원하지 않는 provider는 `UNKNOWN`으로 안전하게 격리됨
@@ -1006,12 +1087,14 @@ event oracle은 각 Run의 sequence가 1부터 연속이고 projection version�
 - tenant quota와 usage ledger
 - step/token/time/cost budget
 - loop detection과 circuit breaker
+- AI 모델 릴리스 예제의 approval·canary·promotion·rollback 전체 흐름
 
 종료 조건:
 
 - provider 변경이 workflow kernel 수정 없이 가능
 - tool version/args가 바뀌면 승인이 무효화됨
 - tenant 격리와 비용 집계가 자동 검증됨
+- mock adapter를 실제 adapter로 바꿔도 Run·Step·Attempt·Effect contract가 유지됨
 
 ## 19. 권장 저장소 구조
 
@@ -1042,6 +1125,9 @@ agent-runtime-platform/
 │   ├── fault-injection/
 │   ├── security/
 │   └── evaluation/
+├── examples/
+│   └── ai-model-release/
+│       └── README.md
 ├── docs/
 │   ├── adr/
 │   ├── runbooks/
@@ -1055,16 +1141,17 @@ agent-runtime-platform/
 
 구현 전에 아래 결정을 ADR로 고정한다.
 
-1. PostgreSQL authoritative runtime과 Temporal 도입 기준
-2. projection + append-only event의 원자적 기록
-3. PostgreSQL queue와 broker 전환 기준
-4. at-least-once transport와 tool effect semantics
-5. immutable agent/model/tool/policy version
-6. Tool Gateway 단일 policy enforcement point
-7. metadata-only telemetry 기본값
-8. tenant isolation과 PostgreSQL RLS
-9. encrypted content store와 삭제·retention
-10. runtime compatibility와 rolling upgrade
+1. 범용 플랫폼 코어와 업무 패키지의 의존 방향
+2. PostgreSQL authoritative runtime과 Temporal 도입 기준
+3. projection + append-only event의 원자적 기록
+4. PostgreSQL queue와 broker 전환 기준
+5. at-least-once transport와 tool effect semantics
+6. immutable agent/model/tool/policy version
+7. Tool Gateway 단일 policy enforcement point
+8. metadata-only telemetry 기본값
+9. Tenant·Project isolation과 PostgreSQL RLS
+10. encrypted content store와 삭제·retention
+11. runtime compatibility와 rolling upgrade
 
 ## 21. 출시 차단 기준
 
@@ -1077,7 +1164,7 @@ agent-runtime-platform/
 - 고위험 tool이 policy/approval 없이 실행됨
 - 외부 결과를 알 수 없는데 자동 retry로 중복 부작용 가능
 - raw secret이 log, trace, checkpoint, queue, DLQ에 남음
-- 다른 tenant의 Run, memory, trace, object에 접근 가능
+- 다른 Tenant 또는 권한 없는 Project의 Run, connection, memory, trace, object에 접근 가능
 - agent/prompt/model/tool/policy version을 재구성할 수 없음
 - trace 유실이 감지되지 않음
 - backup은 있으나 restore test가 없음
@@ -1110,4 +1197,4 @@ agent-runtime-platform/
 
 ## 23. 다음 결정
 
-이 문서가 승인되면 Phase 0과 Phase 1만 대상으로 별도 구현 계획을 작성한다. Phase 2 이후는 Phase 1의 실제 데이터 모델과 fault-injection 결과를 검토한 뒤 각각 독립 계획으로 나눈다.
+다음 작업은 Phase 0과 Phase 1만 대상으로 별도 구현 계획을 작성하는 것이다. 첫 vertical slice는 [AI Model Release Agent 예제 패키지](../../examples/ai-model-release/README.md)의 후보 조회 → mock model 판단 → mock 평가 → 결과 저장 경로로 고정한다. Phase 2 이후는 Phase 1의 실제 데이터 모델과 fault-injection 결과를 검토한 뒤 각각 독립 계획으로 나눈다.

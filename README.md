@@ -2,29 +2,32 @@
 
 에이전트의 정의부터 실행, 도구 호출, 메모리, 복구, 추적까지 담당하는 엔터프라이즈급 런타임입니다.
 
-> 현재 상태: 프로젝트 설계용 README만 있는 초기 저장소
+> 현재 상태: 구현 전 기준 설계와 첫 번째 AI 업무 예제를 정의한 초기 저장소
 
 ## 설계 문서
 
 - [Agent Runtime Platform 엔터프라이즈 설계](docs/architecture/agent-runtime-platform.md)
+- [AI 모델 릴리스 Agent 예제 패키지](examples/ai-model-release/README.md)
 
 ## 목표
 
 - 서버나 워커 장애 후에도 중단된 실행을 안전하게 이어갑니다.
 - provider의 idempotency 계약 안에서 도구 중복 효과를 방지하고, 결과가 불명확하면 자동 재시도 대신 조정 절차로 전환합니다.
 - 모든 실행을 `run → step → model call → tool call → result` 단위로 추적합니다.
-- 테넌트별 권한, 한도, 비용, 데이터 보존 정책을 분리합니다.
+- Tenant와 Project별 권한, 한도, 비용, 데이터 보존 정책을 분리합니다.
 
 ## 책임 범위
 
 | 영역 | 책임 |
 | --- | --- |
-| Control Plane | 에이전트 정의·버전·모델 정책·도구 권한·배포 상태 |
-| Runtime | 상태 전이, 스텝 스케줄링, 병렬 실행, 중단·재개 |
+| Control Plane | Tenant·Project·Membership·Connection과 Agent·Tool 불변 버전 |
+| Runtime | 상태 전이, 순차 스텝 스케줄링, 중단·재개, 장애 복구 |
 | Tool Gateway | 스키마 검증, 인증, 승인, timeout, 감사 로그 |
-| Memory | 단기·장기 메모리, 출처, TTL, 사용자·테넌트 격리 |
+| Memory | 단기·장기 메모리, 출처, TTL, 사용자·Project·Tenant 격리 |
 | Observability | trace 연결, 실패 재현, 민감정보 마스킹 |
 | Governance | quota, rate limit, 실행 예산, 무한 루프 방지 |
+
+플랫폼 코어는 특정 업무를 알지 못합니다. 모델 평가·벤치마크·배포 같은 AI 업무는 Agent Definition과 Tool 패키지로 등록하며, 해당 패키지가 없어도 플랫폼은 정상적으로 실행되어야 합니다.
 
 ## 핵심 지표
 
@@ -59,6 +62,8 @@
 
 ### 4. Memory와 멀티테넌시
 
+- [ ] Tenant·Project·Principal·Membership 권한 모델 구현
+- [ ] Connection metadata와 secret reference 수명주기 구현
 - [ ] 사용자·조직별 메모리 격리
 - [ ] 출처, 갱신 시점, TTL, 삭제 정책 구현
 - [ ] tenant별 quota, rate limit, 비용 집계
@@ -85,4 +90,4 @@
 - 워커 강제 종료 시나리오에서 실행이 유실 없이 복구됩니다.
 - idempotency를 지원하는 provider에서는 같은 effect가 중복 반영되지 않고, 지원하지 않는 provider의 불명확한 결과는 `OUTCOME_UNKNOWN`으로 격리됩니다.
 - 하나의 run을 입력부터 결과까지 trace로 재구성할 수 있습니다.
-- 테넌트 간 데이터·권한·비용이 분리됨을 자동 테스트로 증명합니다.
+- Tenant 간 격리와 동일 Tenant 내 Project 권한·비용 분리를 자동 테스트로 증명합니다.

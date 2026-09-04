@@ -161,7 +161,7 @@ Run 입력은 모델 artifact 자체가 아니라 외부 registry가 이해하�
 | 일시적 provider 오류 | 같은 Step 아래 새 Attempt |
 | 결과가 불명확한 배포 호출 | Effect와 Step의 `OUTCOME_UNKNOWN` |
 
-Phase 1에서는 후보 조회 → mock model의 structured 판단 → mock 평가 → 결과 저장의 단일 순차 흐름만 실행한다. Phase 2에서 worker lease, retry, cancel, idempotency, reconciliation을 붙이고, Phase 4에서 승인·canary·promotion·rollback 전체 흐름을 활성화한다.
+Phase 1에서는 Run에 입력된 후보 reference → mock model의 structured 판단 → 단일 mock 평가 Tool → 결과 저장의 순차 흐름만 실행한다. Run 접수 idempotency는 Phase 1에 포함하고, Phase 2에서 worker lease, retry, cancel, 외부 Tool effect idempotency, reconciliation을 붙인다. Phase 4에서 승인·canary·promotion·rollback 전체 흐름을 활성화한다.
 
 ## 8. Failure 시나리오
 

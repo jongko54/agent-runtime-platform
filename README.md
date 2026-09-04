@@ -2,11 +2,13 @@
 
 에이전트의 정의부터 실행, 도구 호출, 메모리, 복구, 추적까지 담당하는 엔터프라이즈급 런타임입니다.
 
-> 현재 상태: 구현 전 기준 설계와 첫 번째 AI 업무 예제를 정의한 초기 저장소
+> 현재 상태: 구현 전 기준 설계, 첫 번째 AI 업무 예제, Phase 0·1 실행 계획을 정의한 초기 저장소
 
 ## 설계 문서
 
 - [Agent Runtime Platform 엔터프라이즈 설계](docs/architecture/agent-runtime-platform.md)
+- [Python-first Runtime Stack 설계](docs/superpowers/specs/2026-09-04-python-runtime-stack-design.md)
+- [Phase 0·1 Python 구현 계획](docs/superpowers/plans/2026-09-04-phase-0-1-python-runtime.md)
 - [AI 모델 릴리스 Agent 예제 패키지](examples/ai-model-release/README.md)
 
 ## 목표
@@ -28,6 +30,16 @@
 | Governance | quota, rate limit, 실행 예산, 무한 루프 방지 |
 
 플랫폼 코어는 특정 업무를 알지 못합니다. 모델 평가·벤치마크·배포 같은 AI 업무는 Agent Definition과 Tool 패키지로 등록하며, 해당 패키지가 없어도 플랫폼은 정상적으로 실행되어야 합니다.
+
+## 구현 스택
+
+- Python 3.13, FastAPI, Uvicorn
+- Pydantic v2, SQLAlchemy 2.0 Core, Psycopg 3, Alembic
+- PostgreSQL authoritative state와 단일 asyncio worker
+- uv, Ruff, Pyright strict
+- pytest, pytest-asyncio, Hypothesis, Testcontainers
+
+API와 worker는 같은 Python package를 공유하지만 별도 process로 실행합니다. Domain 계층에서는 FastAPI·Pydantic·SQLAlchemy·Psycopg를 import하지 않습니다.
 
 ## 핵심 지표
 

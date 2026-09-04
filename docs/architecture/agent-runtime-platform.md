@@ -2,6 +2,7 @@
 
 - 문서 상태: 구현 전 기준안
 - 작성일: 2026-09-02
+- 최종 갱신: 2026-09-04
 - 대상 범위: 멀티테넌트 Control Plane → 최소 Agent Runtime → 실행 신뢰성 → 추적·평가 → Model/Tool/Memory Gateway
 - 기준 배포: 초기 Docker Compose, 이후 Kubernetes로 이전
 
@@ -1032,7 +1033,7 @@ event oracle은 각 Run의 sequence가 1부터 연속이고 projection version�
 - Run/Step/Event 저장
 - mock/API model
 - 단일 structured tool
-- AI 모델 릴리스 예제의 후보 조회 → mock model 판단 → mock 평가 → 결과 저장 경로
+- AI 모델 릴리스 예제의 후보 reference 입력 → mock model 판단 → 단일 mock 평가 Tool → 결과 저장 경로
 - REST와 SSE
 - 단일 worker
 
@@ -1100,26 +1101,30 @@ event oracle은 각 Run의 sequence가 1부터 연속이고 projection version�
 
 ```text
 agent-runtime-platform/
-├── apps/
-│   ├── api/
-│   └── worker/
-├── packages/
-│   ├── domain/
-│   │   ├── runs/
-│   │   ├── steps/
-│   │   ├── effects/
-│   │   └── policies/
-│   ├── application/
-│   │   ├── commands/
-│   │   ├── queries/
-│   │   └── ports/
-│   ├── adapters/
-│   │   ├── postgres/
-│   │   ├── models/
-│   │   ├── tools/
-│   │   ├── memory/
-│   │   └── telemetry/
-│   └── contracts/
+├── pyproject.toml
+├── uv.lock
+├── alembic.ini
+├── migrations/
+│   └── versions/
+├── src/
+│   └── agent_platform/
+│       ├── domain/
+│       │   ├── runs/
+│       │   ├── steps/
+│       │   ├── effects/
+│       │   └── policies/
+│       ├── application/
+│       │   ├── commands/
+│       │   ├── queries/
+│       │   └── ports/
+│       ├── adapters/
+│       │   ├── postgres/
+│       │   ├── models/
+│       │   ├── tools/
+│       │   ├── memory/
+│       │   └── telemetry/
+│       ├── api/
+│       └── worker/
 ├── tests/
 │   ├── integration/
 │   ├── fault-injection/
@@ -1135,23 +1140,24 @@ agent-runtime-platform/
 └── compose.yaml
 ```
 
-참조 구현은 TypeScript 기반 API/worker, PostgreSQL, OpenTelemetry를 권장한다. framework는 domain과 port를 침범하지 않는 조건에서 NestJS 또는 Fastify를 선택할 수 있다. queue와 provider SDK는 adapter 뒤에 두므로 선택이 실행 상태 모델을 바꾸지 않아야 한다.
+참조 구현은 Python 3.13, FastAPI/Uvicorn API, asyncio worker, PostgreSQL, Pydantic v2, SQLAlchemy 2.0 Core, Psycopg 3, Alembic을 사용한다. dependency는 uv lockfile로 고정하고 Ruff·Pyright strict·pytest를 기본 gate로 둔다. Domain은 순수 Python으로 유지하며 FastAPI, Pydantic, SQLAlchemy, Psycopg를 import하지 않는다. 구체적인 선택과 concurrency 규칙은 [Python-first Runtime Stack 설계](../superpowers/specs/2026-09-04-python-runtime-stack-design.md)를 따른다.
 
 ## 20. Architecture Decision Record 목록
 
 구현 전에 아래 결정을 ADR로 고정한다.
 
 1. 범용 플랫폼 코어와 업무 패키지의 의존 방향
-2. PostgreSQL authoritative runtime과 Temporal 도입 기준
-3. projection + append-only event의 원자적 기록
-4. PostgreSQL queue와 broker 전환 기준
-5. at-least-once transport와 tool effect semantics
-6. immutable agent/model/tool/policy version
-7. Tool Gateway 단일 policy enforcement point
-8. metadata-only telemetry 기본값
-9. Tenant·Project isolation과 PostgreSQL RLS
-10. encrypted content store와 삭제·retention
-11. runtime compatibility와 rolling upgrade
+2. Python-first API·worker runtime stack
+3. PostgreSQL authoritative runtime과 Temporal 도입 기준
+4. projection + append-only event의 원자적 기록
+5. PostgreSQL queue와 broker 전환 기준
+6. at-least-once transport와 tool effect semantics
+7. immutable agent/model/tool/policy version
+8. Tool Gateway 단일 policy enforcement point
+9. metadata-only telemetry 기본값
+10. Tenant·Project isolation과 PostgreSQL RLS
+11. encrypted content store와 삭제·retention
+12. runtime compatibility와 rolling upgrade
 
 ## 21. 출시 차단 기준
 
@@ -1197,4 +1203,4 @@ agent-runtime-platform/
 
 ## 23. 다음 결정
 
-다음 작업은 Phase 0과 Phase 1만 대상으로 별도 구현 계획을 작성하는 것이다. 첫 vertical slice는 [AI Model Release Agent 예제 패키지](../../examples/ai-model-release/README.md)의 후보 조회 → mock model 판단 → mock 평가 → 결과 저장 경로로 고정한다. Phase 2 이후는 Phase 1의 실제 데이터 모델과 fault-injection 결과를 검토한 뒤 각각 독립 계획으로 나눈다.
+Phase 0과 Phase 1의 작업 순서와 검증 명령은 [Phase 0·1 Python 구현 계획](../superpowers/plans/2026-09-04-phase-0-1-python-runtime.md)을 따른다. 첫 vertical slice는 [AI Model Release Agent 예제 패키지](../../examples/ai-model-release/README.md)의 후보 reference 입력 → mock model 판단 → 단일 mock 평가 Tool → 결과 저장 경로다. Phase 2 이후는 Phase 1의 실제 데이터 모델과 fault-injection 결과를 검토한 뒤 각각 독립 계획으로 나눈다.

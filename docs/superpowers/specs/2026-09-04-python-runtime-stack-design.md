@@ -50,6 +50,127 @@ Agent Runtime Platform의 Phase 0~4는 Python 단일 애플리케이션 스택�
 
 높은 scheduler 처리량과 작은 runtime footprint에 유리하지만 Phase 1에서는 병목 근거가 없다. queue age, CPU profile, connection saturation이 Python 목표를 지속적으로 초과할 때 별도 ADR로 평가한다.
 
+### 2.4 구현 스펙 선택 근거 (PAAR)
+
+이 절에서는 각 선택을 `Problem → Approach → Action → Result`로 설명한다. 목적은
+기술 목록 자체가 아니라, 현재 Phase 0·1에서 해결해야 하는 문제와 이후 확장에 남겨야
+하는 계약을 분명히 하는 것이다.
+
+#### Python 3.13
+
+- **Problem:** 최소 Runtime을 먼저 만들면서도 이후 evaluation, self-hosted inference, model
+  tooling과 연결해야 한다. API와 AI 실행 계층이 다른 언어이면 Run·Step·Tool contract를
+  이중으로 관리하게 된다.
+- **Approach:** API와 worker를 Python 단일 애플리케이션 스택으로 통일한다.
+- **Action:** domain type, schema, error taxonomy, Gateway port를 하나의 `agent_platform`
+  package에서 공유한다.
+- **Result:** 지금은 mock adapter로 시작하고, 이후 실제 Model Gateway나 GPU inference
+  adapter를 같은 contract 뒤에 연결할 수 있다.
+
+#### FastAPI와 Uvicorn
+
+- **Problem:** HTTP 요청은 빠르게 durable acceptance를 완료해야 하지만 model·Tool 호출은
+  지연과 실패가 발생할 수 있다.
+- **Approach:** API 계층은 요청 검증·Run 접수·조회·SSE만 담당하는 얇은 경계로 유지한다.
+- **Action:** FastAPI로 HTTP contract를 정의하고 Uvicorn으로 API process를 실행한다.
+- **Result:** API가 model 또는 Tool 실행에 묶이지 않으며, 이후 API와 worker를 독립적으로
+  확장하거나 재시작할 수 있다.
+
+#### 같은 package의 API·worker 분리
+
+- **Problem:** 긴 model·Tool 실행을 HTTP process 안에서 수행하면 연결, timeout, 배포 장애가
+  사용자 요청 처리까지 전파된다. 반대로 처음부터 여러 microservice로 나누면 계약과 배포
+  단위만 늘어난다.
+- **Approach:** 코드베이스와 domain은 공유하되, API와 worker의 실행 책임만 분리한다.
+- **Action:** API는 Run·Step·Event·Work Item을 durable하게 기록하고, worker만 Work Item을
+  claim하여 Model/Tool port를 호출한다.
+- **Result:** Phase 1에서는 모듈러 모놀리스의 단순성을 유지하면서 Phase 2 이후 worker
+  scaling·lease recovery를 위한 물리적 경계를 확보한다.
+
+#### PostgreSQL 17
+
+- **Problem:** Run projection, append-only event, queue item, idempotency record가 서로 다른
+  권위를 가지면 crash 뒤 실행을 복원하거나 같은 요청을 중복 없이 처리할 수 없다.
+- **Approach:** PostgreSQL을 실행 상태의 유일한 권위로 두고 broker는 나중에도 깨우기 신호로만
+  취급한다.
+- **Action:** Run 접수 시 Run·첫 Step·Event·Work Item을 하나의 transaction으로 기록하고,
+  Phase 1 worker는 `FOR UPDATE SKIP LOCKED`로 ready work를 claim한다.
+- **Result:** process 종료나 중복 전달이 있어도 DB 기록으로 현재 실행 상태를 재구성할 수 있고,
+  Phase 2의 lease·fencing·outbox를 같은 권위 위에 추가할 수 있다.
+
+#### SQLAlchemy Core와 Psycopg 3 async
+
+- **Problem:** 이 Runtime의 핵심 위험은 일반 CRUD보다 상태 전이, row lock, transaction 경계가
+  흐려지는 데 있다.
+- **Approach:** persistence를 adapter에 가두고 SQL과 transaction을 명시적으로 제어한다.
+- **Action:** SQLAlchemy Core로 schema와 query를 구성하고 Psycopg async driver로 PostgreSQL
+  connection을 사용한다. Unit of Work 밖에서 transaction을 열지 않으며 외부 호출 중에는
+  connection과 lock을 보유하지 않는다.
+- **Result:** claim, state transition, event append의 원자성을 검증 가능하게 만들고, 이후
+  stale worker 차단과 recovery 규칙을 구현할 기반을 확보한다.
+
+#### Pydantic v2
+
+- **Problem:** Run input, Agent/Tool version, provider 응답은 외부에서 들어오는 JSON이므로
+  예상하지 못한 필드나 형식 오류가 실행 kernel까지 들어갈 수 있다.
+- **Approach:** HTTP, 설정, registry, Tool 경계마다 명시적인 schema validation을 적용한다.
+- **Action:** Pydantic model에 `extra="forbid"`를 기본으로 두고, provider payload는 adapter에서
+  platform contract로 정규화한다.
+- **Result:** tenant scope나 Tool argument가 우연히 확장되는 것을 막고, immutable version과
+  입력·출력 contract를 재현 가능하게 유지한다.
+
+#### Alembic migration
+
+- **Problem:** Run과 Event는 누적되는 실행 기록이므로 schema를 임의로 변경하면 기존 실행
+  데이터를 읽거나 복구하지 못할 수 있다.
+- **Approach:** DB 구조 변경을 수동 작업이 아니라 versioned migration으로 관리한다.
+- **Action:** schema 변경은 Alembic migration으로만 반영하고, upgrade와 downgrade를 실제
+  PostgreSQL에서 검증한다.
+- **Result:** 개발·CI·배포 환경의 schema를 재현하고, 변경 실패 시 데이터 계약을 보존한 채
+  rollback할 수 있다.
+
+#### `uv`와 lockfile
+
+- **Problem:** 개발 machine, CI, container가 서로 다른 dependency version을 해석하면 같은
+  Runtime code가 다른 동작을 할 수 있다.
+- **Approach:** 호환 범위는 `pyproject.toml`에 두고 실제 artifact graph는 `uv.lock`으로 고정한다.
+- **Action:** 개발·CI·container 준비에서 `uv sync --frozen`을 공통 재현 명령으로 사용한다.
+- **Result:** dependency drift를 줄이고, 상태 전이와 async I/O 검증이 동일한 library 조합에서
+  반복된다.
+
+#### Ruff, Pyright, pytest, Hypothesis, Testcontainers
+
+- **Problem:** Agent Runtime의 치명적 오류는 화면 오류보다 terminal state 재진입, 잘못된
+  idempotency, tenant scope 누락처럼 정상 경로만으로 발견하기 어려운 contract 위반이다.
+- **Approach:** 문법·타입·상태 불변식·실제 PostgreSQL 동작을 서로 다른 검증 계층으로 나눈다.
+- **Action:** Ruff와 Pyright strict를 merge gate로 사용하고, pytest/Hypothesis로 state machine을,
+  Testcontainers와 Compose PostgreSQL로 transaction·queue·scope를 검증한다.
+- **Result:** mock happy path만 통과한 구현을 피하고, Phase 2 fault injection과 recovery test를
+  신뢰할 수 있는 기초 위에서 시작한다.
+
+#### mock Model과 mock Tool vertical slice
+
+- **Problem:** 지금 GPU, 자체 LLM, Kubernetes를 먼저 연결하면 platform의 execution contract
+  문제와 model·infrastructure 문제를 구분할 수 없다.
+- **Approach:** 실제 AI 기능은 Model/Tool Gateway 뒤에 두고, 먼저 deterministic mock 실행
+  경로를 완성한다.
+- **Action:** candidate reference 입력 → mock model의 structured decision →
+  `evaluation.run_suite:v1` mock Tool → 결과·Usage·Event 저장 경로를 구현한다.
+- **Result:** 플랫폼의 durable execution 증거를 먼저 만들고, 이후 실제 provider, vLLM,
+  SGLang, evaluation service를 kernel 변경 없이 교체할 수 있다.
+
+#### Phase 0·1 범위 제한
+
+- **Problem:** 실제 실행 부하와 failure trace가 없는 상태에서 lease, retry, approval, GPU,
+  Kubernetes를 한 번에 구현하면 책임 경계와 원인 분석이 흐려진다.
+- **Approach:** Phase 0·1은 최소 실행 cycle과 그 contract에 집중하고, 신뢰성·관측·governance는
+  관찰된 요구를 바탕으로 다음 단계에 추가한다.
+- **Action:** Phase 1은 단일 worker와 `MODEL_CALL`·`TOOL_CALL`만 지원한다. multi-worker
+  lease/retry/cancel은 Phase 2, telemetry는 Phase 3, 실제 Gateway와 approval은 Phase 4로
+  분리한다.
+- **Result:** 플랫폼 → 실행 신뢰성 → 추적·평가 → 실제 Agent 기능 → inference·infrastructure의
+  순서가 유지되며, 이후 기능이 검증된 Run contract 위에 올라간다.
+
 ## 3. 실행 구조
 
 ```mermaid

@@ -5,7 +5,12 @@ from typing import Any, cast
 
 from pydantic import ValidationError
 
-from agent_platform.application.errors import InvalidInput, PolicyDenied
+from agent_platform.application.errors import (
+    InvalidInput,
+    PolicyDenied,
+    RetryableGatewayError,
+    RuntimeConflict,
+)
 from agent_platform.application.ports import ClaimedWork, ModelGateway, RunRepository, ToolGateway
 from agent_platform.contracts.tools import ToolInvocation
 from agent_platform.contracts.validation import validate_payload
@@ -27,11 +32,17 @@ class RuntimeKernel:
     async def execute(self, work: ClaimedWork) -> None:
         try:
             if work.kind == "MODEL_CALL":
-                await self._model(work)
+                result = await self._model(work)
             elif work.kind == "TOOL_CALL":
-                await self._tool(work)
+                result = await self._tool(work)
             else:
                 raise PolicyDenied("Unsupported step kind")
+        except RuntimeConflict:
+            raise
+        except RetryableGatewayError:
+            await self.repository.retry_work(
+                work, "PROVIDER_TRANSIENT", "Provider temporarily unavailable"
+            )
         except TimeoutError:
             await self.repository.fail_work(
                 work, "OPERATION_TIMEOUT", "Operation exceeded its deadline", timed_out=True
@@ -46,8 +57,26 @@ class RuntimeKernel:
             await self.repository.fail_work(
                 work, "RUNTIME_ERROR", "Execution could not be completed"
             )
+        else:
+            try:
+                if work.kind == "MODEL_CALL":
+                    await self.repository.complete_model(work, result)
+                else:
+                    await self.repository.complete_tool(work, result)
+            except InvalidInput:
+                # Registry schema validation runs inside completion's transaction.
+                # These explicit rejections have rolled back before reaching here.
+                await self.repository.fail_work(
+                    work, "CLIENT_INVALID", "Execution payload is invalid"
+                )
+            except PolicyDenied:
+                await self.repository.fail_work(
+                    work, "POLICY_DENIED", "Execution policy denied operation"
+                )
+            # Other persistence errors and stale leases propagate to the poller:
+            # neither ambiguous commits nor failed failure writes may be retried here.
 
-    async def _model(self, work: ClaimedWork) -> None:
+    async def _model(self, work: ClaimedWork) -> dict[str, Any]:
         if work.agent_spec.get("model_route") != "mock/release-planner-v1":
             raise PolicyDenied("Unsupported model route")
         tool_values = work.agent_spec.get("tools", [])
@@ -64,9 +93,9 @@ class RuntimeKernel:
         invocation = ToolInvocation.model_validate(decision)
         if invocation.tool_version not in allowed_tools:
             raise PolicyDenied("Tool not allowed")
-        await self.repository.complete_model(work, invocation.model_dump(mode="json"))
+        return invocation.model_dump(mode="json")
 
-    async def _tool(self, work: ClaimedWork) -> None:
+    async def _tool(self, work: ClaimedWork) -> dict[str, Any]:
         if work.tool_spec is None:
             raise PolicyDenied("Tool definition is missing")
         tool_version = f"{work.tool_spec.get('name')}:v{work.tool_spec.get('version')}"
@@ -80,4 +109,4 @@ class RuntimeKernel:
                 tool_version=tool_version, arguments=work.input
             )
         validate_payload(result, work.tool_spec["output_schema"])
-        await self.repository.complete_tool(work, result)
+        return result

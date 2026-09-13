@@ -56,7 +56,28 @@ run_events = _table(
     "occurred_at",
 )
 work_items = _table(
-    "work_items", "id tenant_id project_id run_id step_id status", dates="available_at"
+    "work_items",
+    "id tenant_id project_id run_id step_id status worker_id",
+    integers="lease_token attempt_count",
+    dates="available_at lease_expires_at",
+)
+run_attempts = _table(
+    "run_attempts",
+    "id tenant_id project_id run_id step_id work_id worker_id status error_code",
+    integers="attempt_no lease_token",
+    dates="started_at finished_at",
+)
+checkpoints = _table(
+    "checkpoints",
+    "id tenant_id project_id run_id step_id work_id attempt_id agent_version_id "
+    "step_kind result_ref",
+    integers="schema_version",
+    dates="created_at",
+)
+dead_letter_items = _table(
+    "dead_letter_items",
+    "id tenant_id project_id run_id step_id work_id attempt_id reason_code",
+    dates="created_at",
 )
 idempotency_records = _table(
     "idempotency_records", "tenant_id project_id principal_id key request_hash run_id"

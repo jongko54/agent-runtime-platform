@@ -9,8 +9,9 @@ import httpx
 import pytest
 from sqlalchemy import text
 
+from agent_platform.adapters.postgres.repositories import PostgresRunRepository
 from agent_platform.adapters.postgres.seed import seed_example
-from agent_platform.worker.main import WORKER_LOCK_ID
+from agent_platform.application.ports import CreateRunCommand
 
 
 def process_environment(runtime_url):
@@ -106,24 +107,45 @@ async def test_separate_api_and_worker_processes(admin_engine, runtime_url):
 
 
 @pytest.mark.asyncio
-async def test_second_worker_process_is_rejected(admin_engine, runtime_url):
+async def test_two_worker_processes_complete_without_global_lock(
+    admin_engine, runtime_engine, runtime_url
+):
+    seed = await seed_example(admin_engine)
+    repository = PostgresRunRepository(runtime_engine)
+    command = CreateRunCommand(
+        seed.principal,
+        seed.agent_version_id,
+        {"candidate_model_ref": "mock://candidate", "evaluation_suite_ref": "mock://suite"},
+    )
+    runs = [
+        await repository.accept_run(command=command, idempotency_key=f"parallel-{i}")
+        for i in range(10)
+    ]
+    # Holding the legacy singleton lock must not block independently leased workers.
     async with admin_engine.connect() as guard:
-        await guard.execute(text("SELECT pg_advisory_lock(:key)"), {"key": WORKER_LOCK_ID})
+        await guard.execute(text("SELECT pg_advisory_lock(721643817)"))
         await guard.commit()
-        process = await asyncio.create_subprocess_exec(
-            sys.executable,
-            "-m",
-            "agent_platform.worker.main",
-            "--once",
-            env=process_environment(runtime_url),
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.PIPE,
-        )
+        processes = []
         try:
-            _, error = await asyncio.wait_for(process.communicate(), timeout=15)
-            assert process.returncode != 0
-            assert b"already holds the execution lock" in error
+            for _ in range(2):
+                processes.append(
+                    await asyncio.create_subprocess_exec(
+                        sys.executable,
+                        "-m",
+                        "agent_platform.worker.main",
+                        "--drain",
+                        env=process_environment(runtime_url),
+                        stdout=asyncio.subprocess.DEVNULL,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                )
+            for process in processes:
+                _, error = await asyncio.wait_for(process.communicate(), timeout=15)
+                assert process.returncode == 0, error.decode()
+            for run in runs:
+                assert (await repository.get_run(seed.principal, run.run.id)).state == "COMPLETED"
         finally:
-            await stop_process(process)
-            await guard.execute(text("SELECT pg_advisory_unlock(:key)"), {"key": WORKER_LOCK_ID})
+            for process in processes:
+                await stop_process(process)
+            await guard.execute(text("SELECT pg_advisory_unlock(721643817)"))
             await guard.commit()

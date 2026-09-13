@@ -1,10 +1,12 @@
 """Step-sized durable work with explicit transaction boundaries and bound SQL.
 
-Only mock adapters are supported in Phase 1. No lease recovery or automatic retry
-is implied by a PROCESSING row. Each method owns its short database transaction.
+Leased attempts fence stale workers. Only registered deterministic mocks may replay.
+Lock ordering is always work item, run, then step; each operation is a short transaction.
 """
 
 import json
+import math
+import random
 from typing import Any, cast
 from uuid import uuid4
 
@@ -104,8 +106,26 @@ async def _event(
 
 
 class PostgresRunRepository:
-    def __init__(self, engine: AsyncEngine) -> None:
+    def __init__(
+        self,
+        engine: AsyncEngine,
+        *,
+        worker_id: str | None = None,
+        lease_seconds: float = 30,
+        max_attempts: int = 3,
+        retry_base_seconds: float = 1,
+    ) -> None:
+        if not math.isfinite(lease_seconds) or not 0 < lease_seconds <= 3600:
+            raise ValueError("lease_seconds must be finite and between 0 and 3600")
+        if max_attempts < 1 or not math.isfinite(retry_base_seconds) or retry_base_seconds <= 0:
+            raise ValueError("Positive max_attempts and finite retry_base_seconds required")
+        if worker_id is not None and not 1 <= len(worker_id) <= 200:
+            raise ValueError("worker_id must contain 1 to 200 characters")
         self.engine = engine
+        self.worker_id = worker_id if worker_id is not None else uuid4().hex
+        self.lease_seconds = lease_seconds
+        self.max_attempts = max_attempts
+        self.retry_base_seconds = retry_base_seconds
 
     async def check_health(self) -> None:
         async with self.engine.connect() as connection:
@@ -308,7 +328,12 @@ class PostgresRunRepository:
     async def _claim_once(self) -> tuple[ClaimedWork | None, bool]:
         async with self.engine.begin() as conn:
             claim = (
-                (await conn.execute(text("SELECT * FROM public.claim_runtime_work()")))
+                (
+                    await conn.execute(
+                        text("SELECT * FROM public.claim_runtime_work(:owner,:seconds)"),
+                        {"owner": self.worker_id, "seconds": self.lease_seconds},
+                    )
+                )
                 .mappings()
                 .one_or_none()
             )
@@ -320,7 +345,8 @@ class PostgresRunRepository:
                     await conn.execute(
                         text("""
                 SELECT w.id,w.tenant_id,w.project_id,w.run_id,w.step_id,s.kind,s.input,
-                       r.principal_id,a.spec AS agent_spec
+                       r.principal_id,a.spec AS agent_spec,w.worker_id,w.lease_token,
+                       w.attempt_count AS attempt_no
                 FROM work_items w JOIN run_steps s ON s.id=w.step_id
                 JOIN runs r ON r.id=w.run_id JOIN agent_versions a ON a.id=r.agent_version_id
                 WHERE w.id=:id AND w.status='PROCESSING' AND s.state='READY'
@@ -334,7 +360,7 @@ class PostgresRunRepository:
             if row is None:
                 raise RuntimeConflict("Claimed work has inconsistent step state")
             await set_context(conn, str(row["tenant_id"]), str(row["principal_id"]))
-            work = ClaimedWork(**dict(row))
+            work = ClaimedWork(**dict(row), attempt_id=uuid4().hex)
             run = (
                 (
                     await conn.execute(
@@ -343,6 +369,16 @@ class PostgresRunRepository:
                 )
                 .mappings()
                 .one()
+            )
+            await conn.execute(
+                text("""
+                INSERT INTO run_attempts
+                  (id,tenant_id,project_id,run_id,step_id,work_id,attempt_no,worker_id,
+                   lease_token,status)
+                VALUES (:attempt,:tenant,:project,:run,:step,:work,:attempt_no,:owner,
+                        :token,'RUNNING')
+                """),
+                self._lease_params(work),
             )
             if not await _scope(conn, work.tenant_id, work.project_id, work.principal_id):
                 await self._close_failure(
@@ -361,6 +397,8 @@ class PostgresRunRepository:
                     INSERT INTO model_calls
                       (id,tenant_id,project_id,run_id,step_id,model_route,status)
                     VALUES (:id,:tenant,:project,:run,:step,:route,'DISPATCHED')
+                    ON CONFLICT (tenant_id,project_id,run_id,step_id)
+                    DO UPDATE SET status='DISPATCHED'
                 """),
                     {
                         "id": uuid4().hex,
@@ -400,7 +438,10 @@ class PostgresRunRepository:
                     {"id": work.step_id},
                 )
                 work = ClaimedWork(
-                    **dict(row), tool_version_id=str(tool["id"]), tool_spec=dict(tool)
+                    **dict(row),
+                    attempt_id=work.attempt_id,
+                    tool_version_id=str(tool["id"]),
+                    tool_spec=dict(tool),
                 )
             else:
                 raise RuntimeConflict("Unsupported step kind")
@@ -409,6 +450,26 @@ class PostgresRunRepository:
     async def _active(
         self, conn: AsyncConnection, work: ClaimedWork, expected: str | None
     ) -> RowMapping:
+        # Acquire the work lock first, then evaluate expiry in a separate statement:
+        # a lease can expire while this transaction is waiting for that lock.
+        await conn.execute(
+            text("SELECT id FROM work_items WHERE id=:work FOR UPDATE"), {"work": work.id}
+        )
+        active = (
+            await conn.execute(
+                text("""
+            SELECT 1 FROM work_items w JOIN run_attempts a ON a.work_id=w.id
+            WHERE w.id=:work AND w.tenant_id=:tenant AND w.project_id=:project
+              AND w.run_id=:run AND w.step_id=:step AND w.status='PROCESSING'
+              AND w.worker_id=:owner AND w.lease_token=:token
+              AND w.lease_expires_at>clock_timestamp()
+              AND a.id=:attempt AND a.status='RUNNING' AND a.lease_token=w.lease_token
+        """),
+                self._lease_params(work),
+            )
+        ).first()
+        if active is None:
+            raise RuntimeConflict("Work lease is no longer active")
         run = (
             (
                 await conn.execute(
@@ -418,7 +479,7 @@ class PostgresRunRepository:
             WHERE r.id=:run AND r.tenant_id=:tenant AND r.project_id=:project
               AND r.principal_id=:principal AND w.id=:work AND w.step_id=:step
               AND w.status='PROCESSING' AND s.state='RUNNING'
-            FOR UPDATE OF r,w,s
+            FOR UPDATE OF r
         """),
                     {
                         "run": work.run_id,
@@ -437,7 +498,217 @@ class PostgresRunRepository:
             raise RuntimeConflict("Work is no longer active")
         if expected is not None and run["state"] != expected:
             raise RuntimeConflict("Work is in an unexpected state")
+        await conn.execute(
+            text("SELECT id FROM run_steps WHERE id=:step FOR UPDATE"), {"step": work.step_id}
+        )
         return run
+
+    @staticmethod
+    def _lease_params(work: ClaimedWork) -> dict[str, Any]:
+        return {
+            "work": work.id,
+            "tenant": work.tenant_id,
+            "project": work.project_id,
+            "run": work.run_id,
+            "step": work.step_id,
+            "owner": work.worker_id,
+            "token": work.lease_token,
+            "attempt": work.attempt_id,
+            "attempt_no": work.attempt_no,
+        }
+
+    async def heartbeat(self, work: ClaimedWork) -> bool:
+        async with unit_of_work(self.engine, work.tenant_id, work.principal_id) as conn:
+            await conn.execute(
+                text("SELECT id FROM work_items WHERE id=:work FOR UPDATE"), {"work": work.id}
+            )
+            updated = await conn.execute(
+                text("""
+                UPDATE work_items
+                SET lease_expires_at=clock_timestamp()+:seconds*interval '1 second'
+                WHERE id=:work AND tenant_id=:tenant AND project_id=:project AND run_id=:run
+                  AND step_id=:step AND worker_id=:owner AND lease_token=:token
+                  AND status='PROCESSING' AND lease_expires_at>clock_timestamp()
+                  AND EXISTS(SELECT 1 FROM run_attempts a WHERE a.id=:attempt
+                    AND a.work_id=:work AND a.status='RUNNING' AND a.lease_token=:token)
+                RETURNING id
+            """),
+                {**self._lease_params(work), "seconds": self.lease_seconds},
+            )
+            return updated.first() is not None
+
+    async def recover_expired(self, limit: int = 100) -> int:
+        if not 1 <= limit <= 1000:
+            raise InvalidInput("Recovery limit must be between 1 and 1000")
+        recovered = 0
+        # One work lock per transaction avoids holding one run lock while waiting
+        # for another Work, including when concurrent workers reap different runs.
+        for _ in range(limit):
+            async with self.engine.begin() as conn:
+                claim = (
+                    (await conn.execute(text("SELECT * FROM public.expired_runtime_work(1)")))
+                    .mappings()
+                    .one_or_none()
+                )
+                if claim is None:
+                    break
+                await set_context(conn, str(claim["scope_tenant"]))
+                row = (
+                    (
+                        await conn.execute(
+                            text("""
+                    SELECT w.id,w.tenant_id,w.project_id,w.run_id,w.step_id,s.kind,s.input,
+                      r.principal_id,a.spec AS agent_spec,w.worker_id,w.lease_token,
+                      w.attempt_count AS attempt_no,x.id AS attempt_id
+                    FROM work_items w JOIN run_steps s ON s.id=w.step_id
+                    JOIN runs r ON r.id=w.run_id JOIN agent_versions a ON a.id=r.agent_version_id
+                    JOIN run_attempts x ON x.work_id=w.id AND x.lease_token=w.lease_token
+                    WHERE w.id=:work AND w.status='PROCESSING'
+                      AND w.lease_expires_at<=clock_timestamp() AND x.status='RUNNING'
+                """),
+                            {"work": claim["work_id"]},
+                        )
+                    )
+                    .mappings()
+                    .one_or_none()
+                )
+                if row is None:
+                    raise RuntimeConflict("Expired work has inconsistent attempt state")
+                work = ClaimedWork(**dict(row))
+                await set_context(conn, work.tenant_id, work.principal_id)
+                run = (
+                    (
+                        await conn.execute(
+                            text("SELECT * FROM runs WHERE id=:run FOR UPDATE"),
+                            {"run": work.run_id},
+                        )
+                    )
+                    .mappings()
+                    .one()
+                )
+                await conn.execute(
+                    text("SELECT id FROM run_steps WHERE id=:step FOR UPDATE"),
+                    {"step": work.step_id},
+                )
+                if run["state"] not in {"RUNNING", "WAITING_MODEL"}:
+                    raise RuntimeConflict("Expired work has inconsistent run state")
+                await self._reschedule(
+                    conn, work, run, "LEASE_EXPIRED", "Worker lease expired", expired=True
+                )
+                recovered += 1
+        return recovered
+
+    async def retry_work(self, work: ClaimedWork, code: str, message: str) -> None:
+        async with unit_of_work(self.engine, work.tenant_id, work.principal_id) as conn:
+            run = await self._active(conn, work, None)
+            await self._reschedule(conn, work, run, code, message, expired=False)
+
+    async def _reschedule(
+        self,
+        conn: AsyncConnection,
+        work: ClaimedWork,
+        run: RowMapping,
+        code: str,
+        message: str,
+        *,
+        expired: bool,
+    ) -> None:
+        safe = False
+        if work.kind == "MODEL_CALL":
+            safe = (
+                await conn.execute(
+                    text("""
+                SELECT 1 FROM model_calls c JOIN runs r ON r.id=c.run_id
+                JOIN agent_versions a ON a.id=r.agent_version_id
+                WHERE c.step_id=:step AND c.model_route='mock/release-planner-v1'
+                  AND a.spec->>'model_route'='mock/release-planner-v1'
+            """),
+                    {"step": work.step_id},
+                )
+            ).first() is not None
+        elif work.kind == "TOOL_CALL":
+            safe = (
+                await conn.execute(
+                    text("""
+                SELECT 1 FROM tool_calls c JOIN tool_versions t ON t.id=c.tool_version_id
+                WHERE c.step_id=:step AND t.connection_kind='mock' AND t.risk_tier='T1'
+                  AND t.name='evaluation.run_suite' AND t.version=1
+            """),
+                    {"step": work.step_id},
+                )
+            ).first() is not None
+        exhausted = work.attempt_no >= self.max_attempts
+        target = "OUTCOME_UNKNOWN" if not safe else "FAILED" if exhausted else "QUEUED"
+        work_status = "OUTCOME_UNKNOWN" if not safe else "FAILED" if exhausted else "READY"
+        # Equal jitter keeps retries delayed while preserving a strict 60s cap.
+        ceiling = min(60.0, self.retry_base_seconds * 2 ** min(work.attempt_no - 1, 20))
+        delay = random.uniform(ceiling / 2, ceiling)
+        comparison = "<=" if expired else ">"
+        changed = await conn.execute(
+            text(f"""
+            UPDATE work_items SET status=:status,worker_id=NULL,lease_expires_at=NULL,
+              available_at=clock_timestamp()+:delay*interval '1 second'
+            WHERE id=:work AND status='PROCESSING' AND worker_id=:owner AND lease_token=:token
+              AND lease_expires_at {comparison} clock_timestamp() RETURNING id
+        """),
+            {**self._lease_params(work), "status": work_status, "delay": delay},
+        )
+        if changed.first() is None:
+            raise RuntimeConflict("Work lease changed during recovery")
+        attempt_status = "ABANDONED" if expired else "RETRY_SCHEDULED"
+        if not safe:
+            attempt_status = "OUTCOME_UNKNOWN"
+        elif exhausted and not expired:
+            attempt_status = "FAILED"
+        await conn.execute(
+            text("""
+            UPDATE run_attempts SET status=:status,finished_at=clock_timestamp(),error_code=:code
+            WHERE id=:attempt AND status='RUNNING'
+        """),
+            {"status": attempt_status, "code": code, "attempt": work.attempt_id},
+        )
+        await conn.execute(
+            text("UPDATE run_steps SET state=:state WHERE id=:step"),
+            {"state": "READY" if target == "QUEUED" else work_status, "step": work.step_id},
+        )
+        for relation in ("model_calls", "tool_calls"):
+            await conn.execute(
+                text(f"UPDATE {relation} SET status=:status WHERE step_id=:step"),
+                {"status": "PENDING" if target == "QUEUED" else work_status, "step": work.step_id},
+            )
+        error = {
+            "code": "OUTCOME_UNKNOWN" if not safe else "RETRY_EXHAUSTED" if exhausted else code,
+            "message": message,
+        }
+        if target != "QUEUED":
+            await conn.execute(
+                text("UPDATE runs SET error=CAST(:error AS jsonb) WHERE id=:run"),
+                {"error": _json(error), "run": work.run_id},
+            )
+            await conn.execute(
+                text("""
+                INSERT INTO dead_letter_items
+                  (id,tenant_id,project_id,run_id,step_id,work_id,attempt_id,reason_code)
+                VALUES (:id,:tenant,:project,:run,:step,:work,:attempt,:reason)
+            """),
+                {**self._lease_params(work), "id": uuid4().hex, "reason": error["code"]},
+            )
+        event_type = "WORK_RECOVERED" if expired else "WORK_RETRY_SCHEDULED"
+        if target != "QUEUED":
+            event_type = "RUN_OUTCOME_UNKNOWN" if not safe else "RUN_FAILED"
+        await _event(
+            conn,
+            run,
+            target,
+            event_type,
+            "reaper" if expired else "worker",
+            {
+                "step_id": work.step_id,
+                "attempt_id": work.attempt_id,
+                "attempt_no": work.attempt_no,
+                **error,
+            },
+        )
 
     async def complete_model(self, work: ClaimedWork, decision: dict[str, Any]) -> None:
         async with unit_of_work(self.engine, work.tenant_id, work.principal_id) as conn:
@@ -577,6 +848,7 @@ class PostgresRunRepository:
         message: str,
         timed_out: bool,
     ) -> None:
+        await self._end_lease(conn, work, "FAILED", "FAILED")
         await conn.execute(
             text("""
             UPDATE run_steps SET state=CASE WHEN id=:step THEN 'FAILED' ELSE 'SKIPPED' END
@@ -651,9 +923,46 @@ class PostgresRunRepository:
             ),
             {"id": work.step_id, "output": _json(output)},
         )
+        await self._end_lease(conn, work, "DONE", "SUCCEEDED")
         await conn.execute(
-            text("UPDATE work_items SET status='DONE' WHERE id=:id"), {"id": work.id}
+            text("""
+            INSERT INTO checkpoints
+              (id,tenant_id,project_id,run_id,step_id,work_id,attempt_id,agent_version_id,
+               step_kind,result_ref)
+            SELECT :id,:tenant,:project,r.id,:step,:work,:attempt,r.agent_version_id,
+              :kind,:ref FROM runs r WHERE r.id=:run
+        """),
+            {
+                **self._lease_params(work),
+                "id": uuid4().hex,
+                "kind": work.kind,
+                "ref": f"run_steps/{work.step_id}/output",
+            },
         )
+
+    async def _end_lease(
+        self, conn: AsyncConnection, work: ClaimedWork, status: str, attempt_status: str
+    ) -> None:
+        updated = await conn.execute(
+            text("""
+            UPDATE work_items SET status=:status,worker_id=NULL,lease_expires_at=NULL
+            WHERE id=:work AND status='PROCESSING' AND worker_id=:owner
+              AND lease_token=:token AND lease_expires_at>clock_timestamp() RETURNING id
+        """),
+            {**self._lease_params(work), "status": status},
+        )
+        if updated.first() is None:
+            raise RuntimeConflict("Work lease expired before recording outcome")
+        attempt = await conn.execute(
+            text("""
+            UPDATE run_attempts SET status=:status,finished_at=clock_timestamp()
+            WHERE id=:attempt AND work_id=:work AND lease_token=:token
+              AND status='RUNNING' RETURNING id
+        """),
+            {**self._lease_params(work), "status": attempt_status},
+        )
+        if attempt.first() is None:
+            raise RuntimeConflict("Attempt is no longer active")
 
     async def _usage(self, conn: AsyncConnection, work: ClaimedWork, source: str) -> None:
         await conn.execute(

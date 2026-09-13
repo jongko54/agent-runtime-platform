@@ -1,6 +1,10 @@
 """Safe errors crossing application boundaries; never carry provider payloads."""
 
 
+class RetryableGatewayError(Exception):
+    """Explicit transient mock/provider error; never used for persistence errors."""
+
+
 class ApplicationError(Exception):
     code = "APPLICATION_ERROR"
     retryable = False

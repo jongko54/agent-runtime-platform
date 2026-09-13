@@ -62,6 +62,10 @@ class ClaimedWork:
     agent_spec: dict[str, Any]
     tool_version_id: str | None = None
     tool_spec: dict[str, Any] | None = None
+    attempt_id: str = ""
+    attempt_no: int = 1
+    lease_token: int = 0
+    worker_id: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,6 +101,12 @@ class RunRepository(Protocol):
     ) -> list[EventRecord]: ...
 
     async def claim_work(self) -> ClaimedWork | None: ...
+
+    async def heartbeat(self, work: ClaimedWork) -> bool: ...
+
+    async def recover_expired(self, limit: int = 100) -> int: ...
+
+    async def retry_work(self, work: ClaimedWork, code: str, message: str) -> None: ...
 
     async def complete_model(self, work: ClaimedWork, decision: dict[str, Any]) -> None: ...
 

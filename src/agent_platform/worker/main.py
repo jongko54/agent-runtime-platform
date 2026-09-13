@@ -1,10 +1,9 @@
-"""Phase 1 worker CLI. A dedicated session lock excludes a second worker process."""
+"""Leased worker CLI; PostgreSQL fencing permits independent worker processes."""
 
 import argparse
 import asyncio
 import logging
-
-from sqlalchemy import text
+from uuid import uuid4
 
 from agent_platform.adapters.models.mock import MockModelGateway
 from agent_platform.adapters.postgres.database import create_engine
@@ -15,68 +14,50 @@ from agent_platform.settings import Settings
 from agent_platform.worker.poller import WorkerPoller
 
 LOGGER = logging.getLogger(__name__)
-WORKER_LOCK_ID = 721643817
 
 
 async def run_worker(settings: Settings, *, once: bool = False, drain: bool = False) -> None:
     engine = create_engine(settings.database_url)
-    repository = PostgresRunRepository(engine)
+    repository = PostgresRunRepository(
+        engine,
+        worker_id=str(uuid4()),
+        lease_seconds=settings.lease_seconds,
+        max_attempts=settings.max_attempts,
+        retry_base_seconds=settings.retry_base_seconds,
+    )
     poller = WorkerPoller(
         repository,
         RuntimeKernel(
             repository, MockModelGateway(), MockEvaluationTool(), settings.operation_timeout_seconds
         ),
+        heartbeat_interval_seconds=settings.heartbeat_interval_seconds,
     )
     try:
-        async with engine.connect() as guard:
-            acquired = await guard.scalar(
-                text("SELECT pg_try_advisory_lock(:key)"), {"key": WORKER_LOCK_ID}
-            )
-            await guard.commit()
-            if not acquired:
-                raise RuntimeError("Another Phase 1 worker already holds the execution lock")
+        while True:
             try:
-                while True:
-                    # SQLAlchemy may reconnect a dropped connection, but session locks do not
-                    # survive it. Fail closed before claiming another Step if ownership is lost.
-                    owns_lock = await guard.scalar(
-                        text(
-                            "SELECT EXISTS (SELECT 1 FROM pg_locks "
-                            "WHERE locktype = 'advisory' AND pid = pg_backend_pid() "
-                            "AND classid = 0 AND objid = :key AND objsubid = 1 AND granted)"
-                        ),
-                        {"key": WORKER_LOCK_ID},
-                    )
-                    await guard.commit()
-                    if not owns_lock:
-                        raise RuntimeError("Phase 1 worker lost its execution lock")
-                    try:
-                        processed = await poller.poll_once()
-                    except Exception:
-                        LOGGER.error("Worker polling failed; database state requires inspection")
-                        if once or drain:
-                            raise RuntimeError("Worker polling failed") from None
-                        await asyncio.sleep(settings.worker_poll_interval_seconds)
-                        continue
-                    if once or (drain and not processed):
-                        return
-                    if not processed:
-                        await asyncio.sleep(settings.worker_poll_interval_seconds)
-            finally:
-                await guard.execute(
-                    text("SELECT pg_advisory_unlock(:key)"), {"key": WORKER_LOCK_ID}
-                )
-                await guard.commit()
+                processed = await poller.poll_once()
+            except Exception:
+                LOGGER.error("Worker polling failed; unfinished leases remain recoverable")
+                if once or drain:
+                    raise RuntimeError("Worker polling failed") from None
+                await asyncio.sleep(settings.worker_poll_interval_seconds)
+                continue
+            if once or (drain and not processed):
+                return
+            if not processed:
+                await asyncio.sleep(settings.worker_poll_interval_seconds)
     finally:
         await engine.dispose()
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run the Phase 1 single-worker runtime")
+    parser = argparse.ArgumentParser(description="Run the leased execution worker")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--once", action="store_true", help="Claim at most one Step and exit")
     mode.add_argument(
-        "--drain", action="store_true", help="Process ready Steps until the queue is empty"
+        "--drain",
+        action="store_true",
+        help="Process currently due Steps without waiting for retries",
     )
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO)

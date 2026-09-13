@@ -15,6 +15,10 @@ class Settings(BaseSettings):
     migration_database_url: str | None = None
     worker_poll_interval_seconds: float = Field(default=0.25, gt=0, le=10)
     operation_timeout_seconds: float = Field(default=30, gt=0, le=300)
+    lease_seconds: float = Field(default=30, gt=0, le=300)
+    heartbeat_interval_seconds: float = Field(default=5, gt=0, le=60)
+    max_attempts: int = Field(default=3, ge=1, le=100)
+    retry_base_seconds: float = Field(default=1, gt=0, le=60)
     sse_poll_interval_seconds: float = Field(default=0.1, gt=0, le=10)
     sse_heartbeat_seconds: float = Field(default=15, gt=0, le=60)
     development_mode: bool = False
@@ -28,6 +32,12 @@ class Settings(BaseSettings):
         if value is not None and not value.startswith("postgresql+psycopg://"):
             raise ValueError("Use a PostgreSQL Psycopg connection URL")
         return value
+
+    @model_validator(mode="after")
+    def require_safe_heartbeat_interval(self) -> Self:
+        if self.heartbeat_interval_seconds >= self.lease_seconds / 3:
+            raise ValueError("heartbeat_interval_seconds must be less than lease_seconds / 3")
+        return self
 
     @model_validator(mode="after")
     def require_development_token(self) -> Self:

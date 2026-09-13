@@ -4,6 +4,12 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from agent_platform.application.errors import (
+    InvalidInput,
+    PolicyDenied,
+    RetryableGatewayError,
+    RuntimeConflict,
+)
 from agent_platform.application.ports import ClaimedWork
 from agent_platform.application.runtime_kernel import RuntimeKernel
 from agent_platform.worker.poller import WorkerPoller
@@ -117,3 +123,135 @@ async def test_invalid_tool_output_is_never_committed_as_success():
     tool.execute.assert_awaited_once()
     repository.complete_tool.assert_not_awaited()
     assert "secret-output" not in str(repository.fail_work.call_args)
+
+
+@pytest.mark.asyncio
+async def test_retryable_provider_error_only_schedules_safe_retry():
+    repository, model, tool = AsyncMock(), AsyncMock(), AsyncMock()
+    model.decide.side_effect = RetryableGatewayError("secret-provider-payload")
+    await RuntimeKernel(repository, model, tool).execute(work())
+    repository.retry_work.assert_awaited_once_with(
+        work(), "PROVIDER_TRANSIENT", "Provider temporarily unavailable"
+    )
+    repository.fail_work.assert_not_awaited()
+    repository.complete_model.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["MODEL_CALL", "TOOL_CALL"])
+@pytest.mark.parametrize(
+    "error",
+    [
+        RuntimeConflict("stale"),
+        RuntimeError("DB down"),
+        RetryableGatewayError("not a provider error"),
+        TimeoutError(),
+        ValueError("database value error"),
+    ],
+)
+async def test_completion_failure_propagates_without_terminal_failure_or_retry(kind, error):
+    repository, model, tool = AsyncMock(), AsyncMock(), AsyncMock()
+    model.decide.return_value = {"tool_version": "evaluation.run_suite:v1", "arguments": {}}
+    tool.execute.return_value = {}
+    claimed = replace(
+        work(kind),
+        tool_spec={
+            "name": "evaluation.run_suite",
+            "version": 1,
+            "input_schema": {"type": "object"},
+            "output_schema": {"type": "object"},
+        },
+    )
+    repository.complete_model.side_effect = error
+    repository.complete_tool.side_effect = error
+    with pytest.raises(type(error)):
+        await RuntimeKernel(repository, model, tool).execute(claimed)
+    repository.fail_work.assert_not_awaited()
+    repository.retry_work.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_stale_gateway_result_is_not_failed_again():
+    repository, model, tool = AsyncMock(), AsyncMock(), AsyncMock()
+    model.decide.side_effect = RuntimeConflict("stale")
+    with pytest.raises(RuntimeConflict):
+        await RuntimeKernel(repository, model, tool).execute(work())
+    repository.fail_work.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_unknown_provider_exception_remains_terminal():
+    repository, model, tool = AsyncMock(), AsyncMock(), AsyncMock()
+    model.decide.side_effect = RuntimeError("secret-provider-payload")
+    await RuntimeKernel(repository, model, tool).execute(work())
+    repository.fail_work.assert_awaited_once_with(
+        work(), "RUNTIME_ERROR", "Execution could not be completed"
+    )
+    repository.retry_work.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_stale_failure_is_not_written_twice():
+    repository, model, tool = AsyncMock(), AsyncMock(), AsyncMock()
+    model.decide.side_effect = ValueError("invalid payload")
+    repository.fail_work.side_effect = RuntimeConflict("stale")
+    with pytest.raises(RuntimeConflict):
+        await RuntimeKernel(repository, model, tool).execute(work())
+    repository.fail_work.assert_awaited_once()
+    repository.retry_work.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_retry_persistence_failure_propagates_without_terminal_write():
+    repository, model, tool = AsyncMock(), AsyncMock(), AsyncMock()
+    model.decide.side_effect = RetryableGatewayError("transient")
+    repository.retry_work.side_effect = RuntimeError("database unavailable")
+    with pytest.raises(RuntimeError, match="database unavailable"):
+        await RuntimeKernel(repository, model, tool).execute(work())
+    repository.retry_work.assert_awaited_once()
+    repository.fail_work.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["MODEL_CALL", "TOOL_CALL"])
+@pytest.mark.parametrize(
+    "error,code,message",
+    [
+        (InvalidInput("secret schema rejection"), "CLIENT_INVALID", "Execution payload is invalid"),
+        (
+            PolicyDenied("secret policy rejection"),
+            "POLICY_DENIED",
+            "Execution policy denied operation",
+        ),
+    ],
+)
+async def test_completion_semantic_rejection_is_terminal_without_retry(kind, error, code, message):
+    repository, model, tool = AsyncMock(), AsyncMock(), AsyncMock()
+    model.decide.return_value = {"tool_version": "evaluation.run_suite:v1", "arguments": {}}
+    tool.execute.return_value = {}
+    claimed = replace(
+        work(kind),
+        tool_spec={
+            "name": "evaluation.run_suite",
+            "version": 1,
+            "input_schema": {"type": "object"},
+            "output_schema": {"type": "object"},
+        },
+    )
+    repository.complete_model.side_effect = error
+    repository.complete_tool.side_effect = error
+    await RuntimeKernel(repository, model, tool).execute(claimed)
+    repository.fail_work.assert_awaited_once_with(claimed, code, message)
+    repository.retry_work.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_stale_terminal_write_after_semantic_rejection_is_not_repeated():
+    repository, model, tool = AsyncMock(), AsyncMock(), AsyncMock()
+    model.decide.return_value = {"tool_version": "evaluation.run_suite:v1", "arguments": {}}
+    repository.complete_model.side_effect = InvalidInput("schema rejected")
+    repository.fail_work.side_effect = RuntimeConflict("lease expired")
+    with pytest.raises(RuntimeConflict):
+        await RuntimeKernel(repository, model, tool).execute(work())
+    repository.fail_work.assert_awaited_once()
+    repository.retry_work.assert_not_awaited()

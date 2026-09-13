@@ -2,7 +2,7 @@
 
 에이전트 실행을 접수하고, 모델 판단과 도구 호출을 별도 worker에서 실행하며 결과를 PostgreSQL에 저장하는 Python 런타임입니다. 엔터프라이즈 운영을 목표로 단계적으로 구현합니다.
 
-> 현재 상태: Phase 2a 실행 신뢰성 기반. mock 작업에 lease·heartbeat·fencing, 제한된 재시도, Step checkpoint와 자동 복구를 추가했습니다. 운영용 인증·외부 효과 조정·취소 API·실제 LLM/GPU 연동은 아직 구현하지 않았습니다.
+> 현재 상태: Phase 2b. lease·복구에 Tool effect 기록, idempotent mock provider, 취소·결과 조정 API를 추가했습니다. 실제 외부 provider의 exactly-once 보장이나 운영 배포 완료를 뜻하지 않습니다. 운영용 인증·실제 LLM/GPU 연동은 아직 없습니다.
 
 ## 로컬 실행
 
@@ -45,7 +45,7 @@ curl -N http://127.0.0.1:8000/v1/runs/<run_id>/events/stream \
 
 `--once`는 Step 하나만, `--drain`은 현재 due 작업이 없을 때까지 처리합니다. Run 하나에는 Model Step과 Tool Step이 각각 필요합니다. 여러 worker가 Work별 lease로 실행하며, 지속적인 장애 복구에는 일반 worker loop를 사용합니다. `--drain`은 미래 backoff나 아직 만료되지 않은 lease를 기다리지 않습니다.
 
-기존 설치는 [Phase 2a migration 경계](docs/implementation/phase-2a.md#migration-안전)를 먼저 확인합니다. 실행 중인 `PROCESSING` 작업이 있으면 upgrade가 거부됩니다. 기존 데이터베이스에는 자동으로 migration하지 않습니다.
+기존 설치는 [Phase 2b migration 경계](docs/implementation/phase-2b.md#migration과-운영-제약)를 먼저 확인합니다. 실행 중 작업·미확정 효과가 있으면 migration이 거부될 수 있습니다. 기존 데이터베이스에는 자동으로 migration하지 않습니다.
 
 ## 검증
 
@@ -59,7 +59,7 @@ docker compose config --quiet
 
 통합 테스트는 Docker에 **별도 폐기 가능한 PostgreSQL**을 생성합니다. 기존 DB에서 테스트를 실행하거나 Docker 부재 시 SQLite로 대체하지 않습니다. CI도 같은 명령으로 검사합니다.
 
-100건 동시 idempotency 접수, schema·상태 전이, 실제 non-superuser RLS, Project 권한, 별도 API·worker 프로세스, 병렬 worker, SIGKILL 복구, stale commit 거부, 실패 후 다음 Run 실행, SSE 재접속을 검사합니다. 범위와 제약은 [Phase 2a 구현 현황](docs/implementation/phase-2a.md)에 기록합니다.
+100건 동시 idempotency 접수, schema·상태 전이, 실제 non-superuser RLS, Project 권한, 별도 API·worker 프로세스, 병렬 worker, SIGKILL 복구, stale commit 거부, 취소/dispatch 경합, provider 결과 재사용, SSE 재접속을 검사합니다. 범위와 제약은 [Phase 2b 구현 현황](docs/implementation/phase-2b.md)에 기록합니다.
 
 ## 설계 문서
 
@@ -69,6 +69,8 @@ docker compose config --quiet
 - [Phase 0·1 구현 현황과 운영 경계](docs/implementation/phase-0-1.md)
 - [Phase 2a worker lease·복구 구현](docs/implementation/phase-2a.md)
 - [Phase 2a 실행 계획](docs/superpowers/plans/2026-09-13-phase-2a-recovery.md)
+- [Phase 2b Tool 효과·취소·조정](docs/implementation/phase-2b.md)
+- [Phase 2b 실행 계획](docs/superpowers/plans/2026-09-13-phase-2b-effects-cancellation.md)
 - [AI 모델 릴리스 Agent 예제 패키지](examples/ai-model-release/README.md)
 
 ## 이후 달성할 운영 목표
@@ -117,7 +119,8 @@ API와 worker는 같은 Python package를 공유하지만 별도 process로 실�
 - [x] PostgreSQL 기반 event/run store와 단일 worker 구현
 - [x] worker lease, heartbeat, fencing과 mock 작업 회수
 - [x] SSE 이벤트 조회·재접속
-- [ ] cancellation, backpressure 처리
+- [x] cancel/dispatch 직렬화와 결과 확인 기반 취소 상태
+- [ ] backpressure 처리
 
 ### 2. Durable Execution
 
@@ -125,7 +128,8 @@ API와 worker는 같은 Python package를 공유하지만 별도 process로 실�
 - [x] mock retry, exponential backoff, dead-letter 기록
 - [ ] 수동 pause/resume, 권한 기반 DLQ redrive
 - [x] Run 접수 idempotency key와 mock 도구 호출 기록
-- [ ] 외부 Tool effect idempotency·결과 불확실성 조정
+- [x] Tool effect 원장·mock provider idempotency·결과 조정 API
+- [ ] 실제 외부 provider의 중복 제거 기간·결과 조회 계약 적용
 - [ ] 외부 부작용 실패 시 조회·보상 전략 작성
 
 ### 3. Tool Gateway와 보안

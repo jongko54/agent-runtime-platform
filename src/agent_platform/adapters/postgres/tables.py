@@ -40,9 +40,9 @@ tool_versions = _table(
 )
 runs = _table(
     "runs",
-    "id tenant_id project_id principal_id agent_version_id state",
+    "id tenant_id project_id principal_id agent_version_id state cancellation_outcome",
     "input result error",
-    "state_version",
+    "state_version cancel_epoch",
     "created_at updated_at",
 )
 run_steps = _table(
@@ -92,4 +92,17 @@ tool_calls = _table(
 )
 usage_entries = _table(
     "usage_entries", "id tenant_id project_id run_id step_id source unit", integers="quantity"
+)
+tool_effects = _table(
+    "tool_effects",
+    "id tenant_id project_id run_id step_id tool_version_id tool_version idempotency_key "
+    "request_hash status dispatch_token dispatch_attempt_id",
+    "arguments result",
+    dates="created_at updated_at",
+)
+mock_provider_results = _table(
+    "mock_provider_results",
+    "idempotency_key tenant_id project_id request_hash",
+    "result",
+    dates="created_at",
 )

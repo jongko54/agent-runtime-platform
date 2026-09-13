@@ -79,6 +79,7 @@ ALLOWED_TRANSITIONS: dict[RunState, frozenset[RunState]] = {
     RunState.CANCEL_REQUESTED: frozenset({RunState.CANCELLED, RunState.OUTCOME_UNKNOWN}),
     RunState.OUTCOME_UNKNOWN: frozenset(
         {
+            RunState.CANCEL_REQUESTED,
             RunState.QUEUED,
             RunState.COMPLETED,
             RunState.FAILED,

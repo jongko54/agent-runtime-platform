@@ -40,3 +40,7 @@ class IdentityProviderNotConfigured(ApplicationError):
 
 class RuntimeConflict(ApplicationError):
     code = "RUNTIME_CONFLICT"
+
+
+class ProviderUnavailable(ApplicationError):
+    code = "PROVIDER_UNAVAILABLE"

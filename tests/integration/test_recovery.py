@@ -274,6 +274,7 @@ async def test_tool_retry_retains_model_checkpoint_and_one_logical_call(
     result = {**command.input, "decision": "EVALUATED", "quality_score": 0.86, "safety_score": 0.99}
     with pytest.raises(RuntimeConflict):
         await repo.complete_tool(tool, result)
+    await repo.begin_tool_dispatch(retried)
     await repo.complete_tool(retried, result)
     assert (await repo.get_run(seed.principal, run.run.id)).state == "COMPLETED"
     async with admin_engine.connect() as conn:
@@ -335,7 +336,7 @@ async def test_migration_requires_active_work_to_be_drained():
             async with engine.connect() as conn:
                 assert (
                     await conn.execute(text("SELECT version_num FROM alembic_version"))
-                ).scalar_one() == "0002"
+                ).scalar_one() == "0003"
                 assert (
                     await conn.execute(text("SELECT status FROM run_attempts"))
                 ).scalar_one() == "RUNNING"

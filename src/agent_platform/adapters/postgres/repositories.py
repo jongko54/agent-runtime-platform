@@ -26,12 +26,13 @@ from agent_platform.application.ports import (
     AcceptedRun,
     ClaimedWork,
     CreateRunCommand,
+    EffectDispatch,
     EventRecord,
     PrincipalContext,
     RunRecord,
 )
 from agent_platform.contracts.validation import validate_payload
-from agent_platform.domain.runs import enforce_transition
+from agent_platform.domain.runs import TERMINAL_STATES, enforce_transition
 
 
 def _json(value: Any) -> str:
@@ -39,7 +40,15 @@ def _json(value: Any) -> str:
 
 
 def _record(row: RowMapping) -> RunRecord:
-    return RunRecord(**{name: row[name] for name in RunRecord.__dataclass_fields__})
+    return RunRecord(**{name: row[name] for name in RunRecord.__dataclass_fields__ if name in row})
+
+
+class _WorkSetChanged(Exception):
+    """Restart a short transaction if Model completion inserted the next Work."""
+
+
+def _dispatch(row: RowMapping) -> EffectDispatch:
+    return EffectDispatch(**{name: row[name] for name in EffectDispatch.__dataclass_fields__})
 
 
 async def _scope(connection: AsyncConnection, tenant: str, project: str, principal: str) -> bool:
@@ -60,12 +69,17 @@ async def _scope(connection: AsyncConnection, tenant: str, project: str, princip
 async def _event(
     connection: AsyncConnection,
     run: RowMapping,
-    target: str,
+    target: str | None,
     event_type: str,
     actor: str,
     payload: dict[str, Any] | None = None,
 ) -> RowMapping:
-    enforce_transition(str(run["state"]), target)
+    if target is None:
+        # Facts such as dispatch need a durable sequence without inventing a
+        # Run transition (RUNNING -> RUNNING is deliberately not a legal edge).
+        target = str(run["state"])
+    else:
+        enforce_transition(str(run["state"]), target)
     updated = (
         (
             await connection.execute(
@@ -433,10 +447,6 @@ class PostgresRunRepository:
                 )
                 if tool is None:
                     raise RuntimeConflict("Tool intent missing")
-                await conn.execute(
-                    text("UPDATE tool_calls SET status='DISPATCHED' WHERE step_id=:id"),
-                    {"id": work.step_id},
-                )
                 work = ClaimedWork(
                     **dict(row),
                     attempt_id=work.attempt_id,
@@ -494,7 +504,7 @@ class PostgresRunRepository:
             .mappings()
             .one_or_none()
         )
-        if run is None or run["state"] not in {"RUNNING", "WAITING_MODEL"}:
+        if run is None or run["state"] not in {"RUNNING", "WAITING_MODEL"} or run["cancel_epoch"]:
             raise RuntimeConflict("Work is no longer active")
         if expected is not None and run["state"] != expected:
             raise RuntimeConflict("Work is in an unexpected state")
@@ -603,6 +613,460 @@ class PostgresRunRepository:
             run = await self._active(conn, work, None)
             await self._reschedule(conn, work, run, code, message, expired=False)
 
+    async def _effect_for_work(self, conn: AsyncConnection, work: ClaimedWork) -> RowMapping:
+        effect = (
+            (
+                await conn.execute(
+                    text("""
+            SELECT * FROM tool_effects WHERE tenant_id=:tenant AND project_id=:project
+              AND run_id=:run AND step_id=:step FOR UPDATE
+        """),
+                    self._lease_params(work),
+                )
+            )
+            .mappings()
+            .one_or_none()
+        )
+        if effect is None or work.kind != "TOOL_CALL":
+            raise RuntimeConflict("Tool effect missing")
+        return effect
+
+    async def begin_tool_dispatch(self, work: ClaimedWork) -> EffectDispatch:
+        async with unit_of_work(self.engine, work.tenant_id, work.principal_id) as conn:
+            run = await self._active(conn, work, "RUNNING")
+            if not await _scope(conn, work.tenant_id, work.project_id, work.principal_id):
+                raise PolicyDenied("Execution permission revoked")
+            effect = await self._effect_for_work(conn, work)
+            if effect["status"] not in {"PREPARED", "DISPATCHED"}:
+                raise RuntimeConflict("Effect cannot be dispatched")
+            if effect["status"] == "DISPATCHED":
+                if effect["dispatch_attempt_id"] == work.attempt_id:
+                    raise RuntimeConflict("Attempt already dispatched")
+                if effect["tool_version"] != "evaluation.run_suite:v1":
+                    raise RuntimeConflict("Unknown effect cannot be blindly replayed")
+            if (
+                work.tool_version_id != effect["tool_version_id"]
+                or work.input != effect["arguments"]
+            ):
+                raise RuntimeConflict("Tool effect intent changed")
+            digest = canonical_digest(
+                {"tool_version": effect["tool_version"], "arguments": effect["arguments"]}
+            )
+            if digest != effect["request_hash"]:
+                raise RuntimeConflict("Tool effect digest mismatch")
+            live = (
+                await conn.execute(
+                    text("""
+                SELECT 1 FROM work_items WHERE id=:work AND status='PROCESSING'
+                  AND lease_expires_at>clock_timestamp() AND lease_token=:token
+            """),
+                    self._lease_params(work),
+                )
+            ).first()
+            if live is None:
+                raise RuntimeConflict("Work lease expired before dispatch")
+            effect = (
+                (
+                    await conn.execute(
+                        text("""
+                UPDATE tool_effects SET status='DISPATCHED',dispatch_token=:dispatch,
+                  dispatch_attempt_id=:attempt,updated_at=clock_timestamp()
+                WHERE id=:id RETURNING *
+            """),
+                        {"id": effect["id"], "dispatch": uuid4().hex, "attempt": work.attempt_id},
+                    )
+                )
+                .mappings()
+                .one()
+            )
+            await conn.execute(
+                text("UPDATE tool_calls SET status='DISPATCHED' WHERE step_id=:step"),
+                {"step": work.step_id},
+            )
+            await _event(
+                conn,
+                run,
+                None,
+                "TOOL_DISPATCHED",
+                "worker",
+                {
+                    "effect_id": effect["id"],
+                    "attempt_id": work.attempt_id,
+                    "dispatch_token": effect["dispatch_token"],
+                },
+            )
+            return _dispatch(effect)
+
+    async def mark_tool_unknown(self, work: ClaimedWork) -> None:
+        async with unit_of_work(self.engine, work.tenant_id, work.principal_id) as conn:
+            run = await self._active(conn, work, "RUNNING")
+            effect = await self._effect_for_work(conn, work)
+            if effect["status"] != "DISPATCHED" or effect["dispatch_attempt_id"] != work.attempt_id:
+                raise RuntimeConflict("Effect is not dispatched by this attempt")
+            await self._end_lease(conn, work, "OUTCOME_UNKNOWN", "OUTCOME_UNKNOWN")
+            await self._unknown_effect(conn, work, run)
+
+    async def _unknown_effect(
+        self, conn: AsyncConnection, work: ClaimedWork, run: RowMapping
+    ) -> None:
+        for relation in ("tool_effects", "tool_calls"):
+            await conn.execute(
+                text(f"UPDATE {relation} SET status='OUTCOME_UNKNOWN' WHERE step_id=:step"),
+                {"step": work.step_id},
+            )
+        await conn.execute(
+            text("UPDATE run_steps SET state='OUTCOME_UNKNOWN' WHERE id=:step"),
+            {"step": work.step_id},
+        )
+        await conn.execute(
+            text("""
+            INSERT INTO dead_letter_items
+              (id,tenant_id,project_id,run_id,step_id,work_id,attempt_id,reason_code)
+            VALUES (:id,:tenant,:project,:run,:step,:work,:attempt,'OUTCOME_UNKNOWN')
+            ON CONFLICT(work_id) DO NOTHING
+        """),
+            {**self._lease_params(work), "id": uuid4().hex},
+        )
+        await conn.execute(
+            text("UPDATE runs SET error=CAST(:error AS jsonb) WHERE id=:run"),
+            {
+                "run": work.run_id,
+                "error": _json(
+                    {
+                        "code": "OUTCOME_UNKNOWN",
+                        "message": "Tool outcome requires provider reconciliation",
+                    }
+                ),
+            },
+        )
+        await _event(
+            conn, run, "OUTCOME_UNKNOWN", "RUN_OUTCOME_UNKNOWN", "worker", {"step_id": work.step_id}
+        )
+
+    async def _locked_run(
+        self, conn: AsyncConnection, principal: PrincipalContext, run_id: str
+    ) -> RowMapping:
+        await self._authorized_run(conn, principal, run_id)
+        locked_ids = (
+            (
+                await conn.execute(
+                    text("""
+            SELECT id FROM work_items WHERE run_id=:run ORDER BY id FOR UPDATE
+        """),
+                    {"run": run_id},
+                )
+            )
+            .scalars()
+            .all()
+        )
+        run = (
+            (
+                await conn.execute(
+                    text("SELECT * FROM runs WHERE id=:run FOR UPDATE"), {"run": run_id}
+                )
+            )
+            .mappings()
+            .one()
+        )
+        current_ids = (
+            (
+                await conn.execute(
+                    text("""
+            SELECT id FROM work_items WHERE run_id=:run ORDER BY id
+        """),
+                    {"run": run_id},
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if current_ids != locked_ids:
+            # Do not acquire new Work while holding Run: a claimant may hold it
+            # and wait on our Run. Roll back, then acquire the entire new set.
+            raise _WorkSetChanged()
+        if not await _scope(
+            conn, principal.tenant_id, str(run["project_id"]), principal.principal_id
+        ):
+            raise ExecutionScopeNotFound()
+        await conn.execute(
+            text("SELECT id FROM run_steps WHERE run_id=:run ORDER BY id FOR UPDATE"),
+            {"run": run_id},
+        )
+        await conn.execute(
+            text("SELECT id FROM tool_effects WHERE run_id=:run ORDER BY id FOR UPDATE"),
+            {"run": run_id},
+        )
+        return run
+
+    async def cancel_run(self, principal: PrincipalContext, run_id: str) -> RunRecord:
+        while True:
+            try:
+                async with unit_of_work(
+                    self.engine, principal.tenant_id, principal.principal_id
+                ) as conn:
+                    run = await self._locked_run(conn, principal, run_id)
+                    if run["state"] in TERMINAL_STATES or run["cancel_epoch"]:
+                        return _record(run)
+                    effects = (
+                        (
+                            await conn.execute(
+                                text("SELECT * FROM tool_effects WHERE run_id=:run"),
+                                {"run": run_id},
+                            )
+                        )
+                        .mappings()
+                        .all()
+                    )
+                    uncertain = any(
+                        e["status"] in {"DISPATCHED", "OUTCOME_UNKNOWN"} for e in effects
+                    )
+                    target = "OUTCOME_UNKNOWN" if uncertain else "CANCELLED"
+                    run = (
+                        (
+                            await conn.execute(
+                                text("""
+                        UPDATE runs SET cancel_epoch=cancel_epoch+1,cancellation_outcome=:outcome
+                        WHERE id=:run RETURNING *
+                    """),
+                                {
+                                    "run": run_id,
+                                    "outcome": "OUTCOME_UNKNOWN" if uncertain else "NO_EFFECT",
+                                },
+                            )
+                        )
+                        .mappings()
+                        .one()
+                    )
+                    await conn.execute(
+                        text("""
+                        UPDATE work_items SET status=:target,worker_id=NULL,lease_expires_at=NULL,
+                          lease_token=lease_token+1 WHERE run_id=:run AND status IN
+                          ('READY','PROCESSING','OUTCOME_UNKNOWN')
+                    """),
+                        {"run": run_id, "target": target},
+                    )
+                    await conn.execute(
+                        text("""
+                        UPDATE run_attempts SET status=:status,finished_at=clock_timestamp(),
+                          error_code='CANCEL_REQUESTED' WHERE run_id=:run AND status='RUNNING'
+                    """),
+                        {"run": run_id, "status": "OUTCOME_UNKNOWN" if uncertain else "ABANDONED"},
+                    )
+                    await conn.execute(
+                        text("""
+                        UPDATE run_steps SET state=:target WHERE run_id=:run AND state IN
+                          ('PENDING','READY','RUNNING','OUTCOME_UNKNOWN')
+                    """),
+                        {"run": run_id, "target": target},
+                    )
+                    await conn.execute(
+                        text("""
+                        UPDATE tool_effects SET status=CASE WHEN status='PREPARED' THEN 'CANCELLED'
+                          ELSE 'OUTCOME_UNKNOWN' END,updated_at=clock_timestamp()
+                        WHERE run_id=:run AND status IN ('PREPARED','DISPATCHED','OUTCOME_UNKNOWN')
+                    """),
+                        {"run": run_id},
+                    )
+                    for relation in ("model_calls", "tool_calls"):
+                        await conn.execute(
+                            text(
+                                f"UPDATE {relation} SET status=:target WHERE run_id=:run "
+                                "AND status IN ('PENDING','DISPATCHED','OUTCOME_UNKNOWN')"
+                            ),
+                            {"run": run_id, "target": target},
+                        )
+                    run = await _event(
+                        conn,
+                        run,
+                        "CANCEL_REQUESTED",
+                        "RUN_CANCEL_REQUESTED",
+                        principal.principal_id,
+                    )
+                    run = await _event(
+                        conn,
+                        run,
+                        target,
+                        "RUN_OUTCOME_UNKNOWN" if uncertain else "RUN_CANCELLED",
+                        principal.principal_id,
+                    )
+                    return _record(run)
+            except _WorkSetChanged:
+                continue
+
+    async def pending_effect(
+        self, principal: PrincipalContext, run_id: str
+    ) -> EffectDispatch | None:
+        async with unit_of_work(self.engine, principal.tenant_id, principal.principal_id) as conn:
+            run = await self._authorized_run(conn, principal, run_id)
+            if run["state"] != "OUTCOME_UNKNOWN":
+                return None
+            effect = (
+                (
+                    await conn.execute(
+                        text("""
+                SELECT * FROM tool_effects WHERE run_id=:run AND status='OUTCOME_UNKNOWN'
+            """),
+                        {"run": run_id},
+                    )
+                )
+                .mappings()
+                .one_or_none()
+            )
+            return _dispatch(effect) if effect is not None else None
+
+    async def reconcile_effect(
+        self,
+        principal: PrincipalContext,
+        run_id: str,
+        effect: EffectDispatch,
+        result: dict[str, Any],
+    ) -> RunRecord:
+        while True:
+            try:
+                async with unit_of_work(
+                    self.engine, principal.tenant_id, principal.principal_id
+                ) as conn:
+                    run = await self._locked_run(conn, principal, run_id)
+                    stored = (
+                        (
+                            await conn.execute(
+                                text("SELECT * FROM tool_effects WHERE run_id=:run AND id=:id"),
+                                {"run": run_id, "id": effect.id},
+                            )
+                        )
+                        .mappings()
+                        .one_or_none()
+                    )
+                    if stored is None or _dispatch(stored) != effect:
+                        raise RuntimeConflict("Effect snapshot changed")
+                    if stored["status"] == "SUCCEEDED" and run["state"] in TERMINAL_STATES:
+                        return _record(run)
+                    if run["state"] != "OUTCOME_UNKNOWN" or stored["status"] != "OUTCOME_UNKNOWN":
+                        raise RuntimeConflict("Effect is not awaiting reconciliation")
+                    if effect.tool_version != "evaluation.run_suite:v1":
+                        raise PolicyDenied("Provider reconciliation is not supported")
+                    await conn.execute(
+                        text("SELECT set_config('app.project_id',:project,true)"),
+                        {"project": effect.project_id},
+                    )
+                    provider = (
+                        (
+                            await conn.execute(
+                                text("""
+                        SELECT * FROM mock_provider_results WHERE idempotency_key=:key
+                          AND tenant_id=:tenant AND project_id=:project
+                    """),
+                                {
+                                    "key": effect.idempotency_key,
+                                    "tenant": effect.tenant_id,
+                                    "project": effect.project_id,
+                                },
+                            )
+                        )
+                        .mappings()
+                        .one_or_none()
+                    )
+                    if (
+                        provider is None
+                        or provider["request_hash"] != stored["request_hash"]
+                        or provider["result"] != result
+                    ):
+                        raise RuntimeConflict("Stored provider result does not confirm this effect")
+                    schemas = (
+                        (
+                            await conn.execute(
+                                text("""
+                        SELECT t.output_schema,a.spec FROM tool_versions t
+                        JOIN agent_versions a ON a.id=:agent WHERE t.id=:tool
+                    """),
+                                {
+                                    "agent": run["agent_version_id"],
+                                    "tool": stored["tool_version_id"],
+                                },
+                            )
+                        )
+                        .mappings()
+                        .one()
+                    )
+                    validate_payload(result, cast(dict[str, Any], schemas["output_schema"]))
+                    for relation in ("tool_effects", "tool_calls"):
+                        await conn.execute(
+                            text(
+                                f"UPDATE {relation} SET status='SUCCEEDED',"
+                                "result=CAST(:result AS jsonb) "
+                                "WHERE step_id=:step"
+                            ),
+                            {"step": stored["step_id"], "result": _json(result)},
+                        )
+                    await conn.execute(
+                        text(
+                            "UPDATE run_steps SET state='SUCCEEDED',output=CAST(:result AS jsonb) "
+                            "WHERE id=:step"
+                        ),
+                        {"step": stored["step_id"], "result": _json(result)},
+                    )
+                    await conn.execute(
+                        text("UPDATE work_items SET status='DONE' WHERE step_id=:step"),
+                        {"step": stored["step_id"]},
+                    )
+                    await conn.execute(
+                        text("""
+                        INSERT INTO checkpoints(id,tenant_id,project_id,run_id,step_id,work_id,
+                          attempt_id,agent_version_id,step_kind,result_ref)
+                        SELECT :id,e.tenant_id,e.project_id,e.run_id,e.step_id,a.work_id,a.id,
+                          :agent,'TOOL_CALL',:ref FROM tool_effects e JOIN run_attempts a
+                          ON a.id=e.dispatch_attempt_id WHERE e.id=:effect
+                    """),
+                        {
+                            "id": uuid4().hex,
+                            "agent": run["agent_version_id"],
+                            "effect": effect.id,
+                            "ref": f"run_steps/{stored['step_id']}/output",
+                        },
+                    )
+                    await conn.execute(
+                        text("""
+                        INSERT INTO usage_entries
+                          (id,tenant_id,project_id,run_id,step_id,source,quantity,unit)
+                        VALUES(:id,:tenant,:project,:run,:step,'TOOL',1,'call')
+                    """),
+                        {
+                            "id": uuid4().hex,
+                            "tenant": run["tenant_id"],
+                            "project": run["project_id"],
+                            "run": run_id,
+                            "step": stored["step_id"],
+                        },
+                    )
+                    run = (
+                        (
+                            await conn.execute(
+                                text("""
+                        UPDATE runs SET result=CAST(:result AS jsonb),error=NULL,
+                          cancellation_outcome=CASE WHEN cancel_epoch>0
+                            THEN 'EFFECT_SUCCEEDED' ELSE NULL END
+                        WHERE id=:run RETURNING *
+                    """),
+                                {"result": _json(result), "run": run_id},
+                            )
+                        )
+                        .mappings()
+                        .one()
+                    )
+                    target = "CANCELLED" if run["cancel_epoch"] else "COMPLETED"
+                    return _record(
+                        await _event(
+                            conn,
+                            run,
+                            target,
+                            "EFFECT_RECONCILED",
+                            principal.principal_id,
+                            {"effect_id": effect.id, "effect_outcome": "SUCCEEDED"},
+                        )
+                    )
+            except _WorkSetChanged:
+                continue
+
     async def _reschedule(
         self,
         conn: AsyncConnection,
@@ -614,6 +1078,7 @@ class PostgresRunRepository:
         expired: bool,
     ) -> None:
         safe = False
+        dispatched = False
         if work.kind == "MODEL_CALL":
             safe = (
                 await conn.execute(
@@ -627,6 +1092,8 @@ class PostgresRunRepository:
                 )
             ).first() is not None
         elif work.kind == "TOOL_CALL":
+            effect = await self._effect_for_work(conn, work)
+            dispatched = effect["status"] == "DISPATCHED"
             safe = (
                 await conn.execute(
                     text("""
@@ -637,7 +1104,11 @@ class PostgresRunRepository:
                     {"step": work.step_id},
                 )
             ).first() is not None
+            safe = safe and effect["tool_version"] == "evaluation.run_suite:v1"
         exhausted = work.attempt_no >= self.max_attempts
+        if dispatched and (not expired or exhausted):
+            # A reported provider error or exhausted replay cannot prove failure.
+            safe = False
         target = "OUTCOME_UNKNOWN" if not safe else "FAILED" if exhausted else "QUEUED"
         work_status = "OUTCOME_UNKNOWN" if not safe else "FAILED" if exhausted else "READY"
         # Equal jitter keeps retries delayed while preserving a strict 60s cap.
@@ -675,6 +1146,11 @@ class PostgresRunRepository:
             await conn.execute(
                 text(f"UPDATE {relation} SET status=:status WHERE step_id=:step"),
                 {"status": "PENDING" if target == "QUEUED" else work_status, "step": work.step_id},
+            )
+        if work.kind == "TOOL_CALL" and target != "QUEUED":
+            await conn.execute(
+                text("UPDATE tool_effects SET status=:status WHERE step_id=:step"),
+                {"status": "OUTCOME_UNKNOWN" if dispatched else "CANCELLED", "step": work.step_id},
             )
         error = {
             "code": "OUTCOME_UNKNOWN" if not safe else "RETRY_EXHAUSTED" if exhausted else code,
@@ -779,6 +1255,25 @@ class PostgresRunRepository:
                     "arguments": _json(arguments),
                 },
             )
+            await conn.execute(
+                text("""
+                INSERT INTO tool_effects
+                  (id,tenant_id,project_id,run_id,step_id,tool_version_id,tool_version,
+                   idempotency_key,request_hash,arguments,status)
+                VALUES (:step,:tenant,:project,:run,:step,:tool,:reference,:step,
+                  :digest,CAST(:arguments AS jsonb),'PREPARED')
+                """),
+                {
+                    "step": step_id,
+                    "tenant": work.tenant_id,
+                    "project": work.project_id,
+                    "run": work.run_id,
+                    "tool": tool["id"],
+                    "reference": reference,
+                    "digest": canonical_digest({"tool_version": reference, "arguments": arguments}),
+                    "arguments": _json(arguments),
+                },
+            )
             run = await _event(
                 conn, run, "WAITING_TOOL", "TOOL_PROPOSED", "worker", {"step_id": step_id}
             )
@@ -787,6 +1282,9 @@ class PostgresRunRepository:
     async def complete_tool(self, work: ClaimedWork, result: dict[str, Any]) -> None:
         async with unit_of_work(self.engine, work.tenant_id, work.principal_id) as conn:
             run = await self._active(conn, work, "RUNNING")
+            effect = await self._effect_for_work(conn, work)
+            if effect["status"] != "DISPATCHED" or effect["dispatch_attempt_id"] != work.attempt_id:
+                raise RuntimeConflict("Effect is not dispatched by this attempt")
             tool = (
                 (
                     await conn.execute(
@@ -804,6 +1302,13 @@ class PostgresRunRepository:
             if tool is None or work.kind != "TOOL_CALL":
                 raise RuntimeConflict("Dispatched tool call missing")
             validate_payload(result, cast(dict[str, Any], tool["output_schema"]))
+            await conn.execute(
+                text(
+                    "UPDATE tool_effects SET status='SUCCEEDED',result=CAST(:result AS jsonb), "
+                    "updated_at=clock_timestamp() WHERE id=:id"
+                ),
+                {"id": effect["id"], "result": _json(result)},
+            )
             await conn.execute(
                 text("""
                 UPDATE tool_calls SET result=CAST(:result AS jsonb),status='SUCCEEDED'
@@ -848,6 +1353,16 @@ class PostgresRunRepository:
         message: str,
         timed_out: bool,
     ) -> None:
+        if work.kind == "TOOL_CALL":
+            effect = await self._effect_for_work(conn, work)
+            if effect["status"] == "DISPATCHED":
+                await self._end_lease(conn, work, "OUTCOME_UNKNOWN", "OUTCOME_UNKNOWN")
+                await self._unknown_effect(conn, work, run)
+                return
+            await conn.execute(
+                text("UPDATE tool_effects SET status='CANCELLED' WHERE id=:id"),
+                {"id": effect["id"]},
+            )
         await self._end_lease(conn, work, "FAILED", "FAILED")
         await conn.execute(
             text("""

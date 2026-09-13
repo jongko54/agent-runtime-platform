@@ -7,7 +7,7 @@ import sys
 
 from agent_platform.adapters.postgres.database import create_engine
 from agent_platform.adapters.postgres.repositories import PostgresRunRepository
-from agent_platform.adapters.tools.mock_evaluation import MockEvaluationTool
+from agent_platform.adapters.tools.persistent_mock import PersistentMockEvaluationTool
 from agent_platform.settings import Settings
 
 
@@ -18,8 +18,9 @@ async def main():
     assert work is not None
     if sys.argv[1] == "after-tool-return":
         assert work.kind == "TOOL_CALL"
-        result = await MockEvaluationTool().execute(
-            tool_version="evaluation.run_suite:v1", arguments=work.input
+        effect = await repository.begin_tool_dispatch(work)
+        result = await PersistentMockEvaluationTool(engine).execute(
+            tool_version="evaluation.run_suite:v1", arguments=work.input, effect=effect
         )
         assert result["decision"] == "EVALUATED"
     # The parent created this process solely for this kill/recovery test.

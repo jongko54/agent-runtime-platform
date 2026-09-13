@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager
 from dataclasses import asdict
 from typing import Annotated, Any, cast
 
-from fastapi import Depends, FastAPI, Header, Query, Request
+from fastapi import Body, Depends, FastAPI, Header, Query, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -25,13 +25,16 @@ from agent_platform.application.errors import (
     IdentityProviderNotConfigured,
     InvalidInput,
     PolicyDenied,
+    ProviderUnavailable,
     RuntimeConflict,
 )
 from agent_platform.application.ports import (
     CreateRunCommand,
     IdentityVerifier,
     PrincipalContext,
+    RunRecord,
     RunRepository,
+    ToolGateway,
 )
 from agent_platform.application.run_service import RunService
 from agent_platform.settings import Settings
@@ -86,6 +89,26 @@ class CreateRunRequest(BaseModel):
     input: dict[str, Any]
 
 
+class EmptyMutationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+def public_run(run: RunRecord) -> dict[str, Any]:
+    return {
+        "run_id": run.id,
+        "project_id": run.project_id,
+        "agent_version_id": run.agent_version_id,
+        "state": run.state,
+        "state_version": run.state_version,
+        "input": run.input,
+        "result": run.result,
+        "error": run.error,
+        "created_at": run.created_at,
+        "cancel_epoch": run.cancel_epoch,
+        "cancellation_outcome": run.cancellation_outcome,
+    }
+
+
 async def authenticate(request: Request) -> PrincipalContext:
     authorization = request.headers.get("Authorization", "")
     scheme, _, token = authorization.partition(" ")
@@ -114,6 +137,7 @@ def create_app(
     settings: Settings | None = None,
     repository: RunRepository | None = None,
     identity_verifier: IdentityVerifier | None = None,
+    tool_gateway: ToolGateway | None = None,
 ) -> FastAPI:
     configuration = settings or Settings()
 
@@ -126,6 +150,12 @@ def create_app(
 
             engine = create_engine(configuration.database_url)
             application.state.repository = PostgresRunRepository(engine)
+            if tool_gateway is None:
+                from agent_platform.adapters.tools.persistent_mock import (
+                    PersistentMockEvaluationTool,
+                )
+
+                application.state.tool_gateway = PersistentMockEvaluationTool(engine)
         try:
             yield
         finally:
@@ -136,6 +166,7 @@ def create_app(
     app.add_middleware(BoundedBodyMiddleware)
     app.state.repository = repository
     app.state.identity_verifier = identity_verifier
+    app.state.tool_gateway = tool_gateway
     if identity_verifier is None and configuration.development_mode:
         secret = configuration.development_token
         if secret is not None and secret.get_secret_value():
@@ -160,6 +191,7 @@ def create_app(
             RuntimeConflict: (409, "Execution state conflicts with this request"),
             InvalidInput: (422, "Request payload is invalid"),
             PolicyDenied: (403, "Operation is not permitted"),
+            ProviderUnavailable: (503, "Provider result lookup is unavailable"),
         }
         status_code, message = error_mapping.get(type(exc), (500, "Request could not be processed"))
         return error_response(exc.code, message, status_code)
@@ -206,17 +238,40 @@ def create_app(
     @app.get("/v1/runs/{run_id}")
     async def get_run(run_id: str, principal: Principal, repo: Repository) -> dict[str, Any]:
         run = await repo.get_run(principal, run_id)
-        return {
-            "run_id": run.id,
-            "project_id": run.project_id,
-            "agent_version_id": run.agent_version_id,
-            "state": run.state,
-            "state_version": run.state_version,
-            "input": run.input,
-            "result": run.result,
-            "error": run.error,
-            "created_at": run.created_at,
-        }
+        return public_run(run)
+
+    @app.post("/v1/runs/{run_id}/cancel", status_code=202)
+    async def cancel_run(
+        run_id: str,
+        principal: Principal,
+        repo: Repository,
+        body: Annotated[EmptyMutationRequest | None, Body()] = None,
+    ) -> dict[str, Any]:
+        return public_run(await repo.cancel_run(principal, run_id))
+
+    @app.post("/v1/runs/{run_id}/reconcile")
+    async def reconcile_run(
+        request: Request,
+        run_id: str,
+        principal: Principal,
+        repo: Repository,
+        body: Annotated[EmptyMutationRequest | None, Body()] = None,
+    ) -> dict[str, Any]:
+        effect = await repo.pending_effect(principal, run_id)
+        if effect is None:
+            return public_run(await repo.get_run(principal, run_id))
+        provider = cast(ToolGateway | None, request.app.state.tool_gateway)
+        if provider is None:
+            raise ProviderUnavailable()
+        try:
+            async with asyncio.timeout(configuration.operation_timeout_seconds):
+                result = await provider.lookup(effect)
+        except Exception:
+            raise ProviderUnavailable() from None
+        if result is None:
+            # Absence is not proof that an in-flight request cannot still succeed.
+            return public_run(await repo.get_run(principal, run_id))
+        return public_run(await repo.reconcile_effect(principal, run_id, effect, result))
 
     @app.get("/v1/runs/{run_id}/events")
     async def get_events(

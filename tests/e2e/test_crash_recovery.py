@@ -85,6 +85,10 @@ async def test_killed_process_recovers_from_persisted_step(
             pytest.fail("Replacement worker failed to recover the killed attempt")
         assert run.result["decision"] == "EVALUATED"
         async with admin_engine.connect() as conn:
+            # Provider success is independent of the killed runtime commit. A
+            # replacement request uses the same key, not a second provider effect.
+            assert await conn.scalar(text("SELECT count(*) FROM mock_provider_results")) == 1
+            assert await conn.scalar(text("SELECT count(*) FROM tool_effects")) == 1
             assert (
                 await conn.scalar(
                     text("SELECT count(*) FROM run_attempts WHERE run_id=:run"), {"run": run.id}

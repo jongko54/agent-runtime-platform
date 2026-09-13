@@ -2,6 +2,8 @@
 
 Phase 1 최소 실행에 **mock 작업의 장애 복구**를 추가한다. 외부 부작용의 exactly-once 보장이나 전체 Phase 2 완료를 의미하지 않는다.
 
+> 이 문서는 `619e44e`의 Phase 2a 기록이다. 이후 Tool dispatch 경계·취소·조정과 현재 동작은 [Phase 2b](phase-2b.md)를 따른다. 특히 dispatch 이후 Tool timeout·예외는 이제 실패로 단정하지 않고 UNKNOWN으로 분류한다.
+
 ## 무엇이 달라지는가
 
 | 항목 | Phase 1 | Phase 2a |

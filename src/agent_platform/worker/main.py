@@ -8,7 +8,7 @@ from uuid import uuid4
 from agent_platform.adapters.models.mock import MockModelGateway
 from agent_platform.adapters.postgres.database import create_engine
 from agent_platform.adapters.postgres.repositories import PostgresRunRepository
-from agent_platform.adapters.tools.mock_evaluation import MockEvaluationTool
+from agent_platform.adapters.tools.persistent_mock import PersistentMockEvaluationTool
 from agent_platform.application.runtime_kernel import RuntimeKernel
 from agent_platform.settings import Settings
 from agent_platform.worker.poller import WorkerPoller
@@ -28,7 +28,10 @@ async def run_worker(settings: Settings, *, once: bool = False, drain: bool = Fa
     poller = WorkerPoller(
         repository,
         RuntimeKernel(
-            repository, MockModelGateway(), MockEvaluationTool(), settings.operation_timeout_seconds
+            repository,
+            MockModelGateway(),
+            PersistentMockEvaluationTool(engine),
+            settings.operation_timeout_seconds,
         ),
         heartbeat_interval_seconds=settings.heartbeat_interval_seconds,
     )

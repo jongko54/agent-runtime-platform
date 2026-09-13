@@ -4,6 +4,7 @@ from uuid import UUID
 
 import pytest
 
+from agent_platform.adapters.tools.persistent_mock import PersistentMockEvaluationTool
 from agent_platform.settings import Settings
 from agent_platform.worker.main import run_worker
 
@@ -35,6 +36,9 @@ async def test_worker_configures_fenced_owner_without_session_lock_and_drains_du
         retry_base_seconds=0.5,
     )
     assert poller_type.call_args.kwargs["heartbeat_interval_seconds"] == 2
+    tool_gateway = poller_type.call_args.args[1].tool_gateway
+    assert isinstance(tool_gateway, PersistentMockEvaluationTool)
+    assert tool_gateway.engine is engine
     assert poller.poll_once.await_count == 2
     engine.connect.assert_not_called()
     engine.dispose.assert_awaited_once()

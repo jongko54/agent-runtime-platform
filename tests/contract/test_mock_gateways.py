@@ -6,6 +6,7 @@ import pytest
 from agent_platform.adapters.models.mock import MockModelGateway
 from agent_platform.adapters.tools.mock_evaluation import MockEvaluationTool
 from agent_platform.application.errors import InvalidInput, PolicyDenied
+from agent_platform.application.ports import EffectDispatch
 from agent_platform.contracts.agents import AgentVersionSpec
 from agent_platform.contracts.tools import ToolVersionSpec
 from agent_platform.contracts.validation import validate_payload
@@ -63,3 +64,14 @@ async def test_tool_rejects_unknown_version() -> None:
         await MockEvaluationTool().execute(
             tool_version="evaluation.run_suite:v2", arguments=PAYLOAD
         )
+
+
+@pytest.mark.asyncio
+async def test_pure_mock_accepts_effect_but_cannot_claim_durable_lookup():
+    effect = EffectDispatch(
+        "effect", "tenant", "project", "key", "token", "evaluation.run_suite:v1", PAYLOAD
+    )
+    tool = MockEvaluationTool()
+    result = await tool.execute(tool_version=effect.tool_version, arguments=PAYLOAD, effect=effect)
+    assert result["decision"] == "EVALUATED"
+    assert await tool.lookup(effect) is None

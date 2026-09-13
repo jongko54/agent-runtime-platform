@@ -31,6 +31,8 @@ class RunRecord:
     result: dict[str, Any] | None
     error: dict[str, Any] | None
     created_at: datetime
+    cancel_epoch: int = 0
+    cancellation_outcome: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,6 +77,17 @@ class SeedResult:
     agent_version_id: str
 
 
+@dataclass(frozen=True, slots=True)
+class EffectDispatch:
+    id: str
+    tenant_id: str
+    project_id: str
+    idempotency_key: str
+    dispatch_token: str
+    tool_version: str
+    arguments: dict[str, Any]
+
+
 class IdentityVerifier(Protocol):
     async def verify(self, bearer_token: str) -> PrincipalContext: ...
 
@@ -86,7 +99,11 @@ class ModelGateway(Protocol):
 
 
 class ToolGateway(Protocol):
-    async def execute(self, *, tool_version: str, arguments: dict[str, Any]) -> dict[str, Any]: ...
+    async def execute(
+        self, *, tool_version: str, arguments: dict[str, Any], effect: EffectDispatch | None = None
+    ) -> dict[str, Any]: ...
+
+    async def lookup(self, effect: EffectDispatch) -> dict[str, Any] | None: ...
 
 
 class RunRepository(Protocol):
@@ -107,6 +124,24 @@ class RunRepository(Protocol):
     async def recover_expired(self, limit: int = 100) -> int: ...
 
     async def retry_work(self, work: ClaimedWork, code: str, message: str) -> None: ...
+
+    async def begin_tool_dispatch(self, work: ClaimedWork) -> EffectDispatch: ...
+
+    async def mark_tool_unknown(self, work: ClaimedWork) -> None: ...
+
+    async def cancel_run(self, principal: PrincipalContext, run_id: str) -> RunRecord: ...
+
+    async def pending_effect(
+        self, principal: PrincipalContext, run_id: str
+    ) -> EffectDispatch | None: ...
+
+    async def reconcile_effect(
+        self,
+        principal: PrincipalContext,
+        run_id: str,
+        effect: EffectDispatch,
+        result: dict[str, Any],
+    ) -> RunRecord: ...
 
     async def complete_model(self, work: ClaimedWork, decision: dict[str, Any]) -> None: ...
 

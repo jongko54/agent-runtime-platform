@@ -48,8 +48,9 @@ async def test_concurrent_acceptance_and_step_handoff(admin_engine, runtime_engi
             await connection.execute(
                 text("SELECT status FROM tool_calls WHERE step_id=:step"), {"step": tool.step_id}
             )
-        ).scalar_one() == "DISPATCHED"
+        ).scalar_one() == "PENDING"
     output = {**command.input, "decision": "EVALUATED", "quality_score": 0.86, "safety_score": 0.99}
+    await repo.begin_tool_dispatch(tool)
     await repo.complete_tool(tool, output)
     with pytest.raises(RuntimeConflict):
         await repo.complete_tool(tool, output)

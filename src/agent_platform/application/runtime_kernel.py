@@ -30,11 +30,12 @@ class RuntimeKernel:
         self.operation_timeout_seconds = operation_timeout_seconds
 
     async def execute(self, work: ClaimedWork) -> None:
+        if work.kind == "TOOL_CALL":
+            await self._execute_tool(work)
+            return
         try:
             if work.kind == "MODEL_CALL":
                 result = await self._model(work)
-            elif work.kind == "TOOL_CALL":
-                result = await self._tool(work)
             else:
                 raise PolicyDenied("Unsupported step kind")
         except RuntimeConflict:
@@ -58,23 +59,31 @@ class RuntimeKernel:
                 work, "RUNTIME_ERROR", "Execution could not be completed"
             )
         else:
-            try:
-                if work.kind == "MODEL_CALL":
-                    await self.repository.complete_model(work, result)
-                else:
-                    await self.repository.complete_tool(work, result)
-            except InvalidInput:
-                # Registry schema validation runs inside completion's transaction.
-                # These explicit rejections have rolled back before reaching here.
+            await self._complete(work, result)
+
+    async def _complete(self, work: ClaimedWork, result: dict[str, Any]) -> None:
+        try:
+            if work.kind == "MODEL_CALL":
+                await self.repository.complete_model(work, result)
+            else:
+                await self.repository.complete_tool(work, result)
+        except InvalidInput:
+            # Explicit semantic rejections rolled back before reaching here.
+            if work.kind == "TOOL_CALL":
+                await self.repository.mark_tool_unknown(work)
+            else:
                 await self.repository.fail_work(
                     work, "CLIENT_INVALID", "Execution payload is invalid"
                 )
-            except PolicyDenied:
+        except PolicyDenied:
+            if work.kind == "TOOL_CALL":
+                await self.repository.mark_tool_unknown(work)
+            else:
                 await self.repository.fail_work(
                     work, "POLICY_DENIED", "Execution policy denied operation"
                 )
-            # Other persistence errors and stale leases propagate to the poller:
-            # neither ambiguous commits nor failed failure writes may be retried here.
+        # Other persistence errors and stale leases propagate: an ambiguous commit
+        # must never be mistaken for a provider failure or safely retried here.
 
     async def _model(self, work: ClaimedWork) -> dict[str, Any]:
         if work.agent_spec.get("model_route") != "mock/release-planner-v1":
@@ -95,7 +104,7 @@ class RuntimeKernel:
             raise PolicyDenied("Tool not allowed")
         return invocation.model_dump(mode="json")
 
-    async def _tool(self, work: ClaimedWork) -> dict[str, Any]:
+    def _validate_tool(self, work: ClaimedWork) -> tuple[str, dict[str, Any]]:
         if work.tool_spec is None:
             raise PolicyDenied("Tool definition is missing")
         tool_version = f"{work.tool_spec.get('name')}:v{work.tool_spec.get('version')}"
@@ -104,9 +113,44 @@ class RuntimeKernel:
         if tool_version not in work.agent_spec.get("tools", []):
             raise PolicyDenied("Tool not allowed")
         validate_payload(work.input, work.tool_spec["input_schema"])
-        async with asyncio.timeout(self.operation_timeout_seconds):
-            result = await self.tool_gateway.execute(
-                tool_version=tool_version, arguments=work.input
+        return tool_version, work.tool_spec["output_schema"]
+
+    async def _execute_tool(self, work: ClaimedWork) -> None:
+        try:
+            tool_version, output_schema = self._validate_tool(work)
+        except PolicyDenied:
+            await self.repository.fail_work(
+                work, "POLICY_DENIED", "Execution policy denied operation"
             )
-        validate_payload(result, work.tool_spec["output_schema"])
-        return result
+            return
+        except (InvalidInput, ValidationError, ValueError, KeyError, TypeError):
+            await self.repository.fail_work(work, "CLIENT_INVALID", "Execution payload is invalid")
+            return
+
+        # This short transaction serializes dispatch with cancellation. Catch only
+        # known semantic rejections: DB failures must reach the worker unchanged.
+        try:
+            effect = await self.repository.begin_tool_dispatch(work)
+        except PolicyDenied:
+            await self.repository.fail_work(
+                work, "POLICY_DENIED", "Execution policy denied operation"
+            )
+            return
+        except InvalidInput:
+            await self.repository.fail_work(work, "CLIENT_INVALID", "Execution payload is invalid")
+            return
+
+        try:
+            async with asyncio.timeout(self.operation_timeout_seconds):
+                result = await self.tool_gateway.execute(
+                    tool_version=tool_version, arguments=work.input, effect=effect
+                )
+            validate_payload(result, output_schema)
+        except RuntimeConflict:
+            raise
+        except Exception:
+            # Dispatch is durable, so even a timeout or malformed response cannot
+            # establish whether the provider effect happened. Never blind retry.
+            await self.repository.mark_tool_unknown(work)
+            return
+        await self._complete(work, result)

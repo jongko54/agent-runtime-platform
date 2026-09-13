@@ -89,8 +89,11 @@ async def test_tool_failure_does_not_block_next_run(admin_engine, runtime_engine
     first = await repository.accept_run(command=command, idempotency_key="failure")
 
     class FailingTool:
-        async def execute(self, *, tool_version, arguments):
+        async def execute(self, *, tool_version, arguments, effect=None):
             raise RuntimeError("SECRET_provider_detail_do_not_expose")
+
+        async def lookup(self, effect):
+            return None
 
     failing_poller = WorkerPoller(
         repository, RuntimeKernel(repository, MockModelGateway(), FailingTool())
@@ -98,7 +101,7 @@ async def test_tool_failure_does_not_block_next_run(admin_engine, runtime_engine
     assert await failing_poller.poll_once()
     assert await failing_poller.poll_once()
     failed = await repository.get_run(seed.principal, first.run.id)
-    assert failed.state == "FAILED"
+    assert failed.state == "OUTCOME_UNKNOWN"
     assert "SECRET" not in json.dumps(failed.error)
     second = await repository.accept_run(command=command, idempotency_key="following")
     healthy_poller = WorkerPoller(

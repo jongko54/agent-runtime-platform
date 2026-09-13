@@ -42,6 +42,17 @@ class AcceptedRun:
 
 
 @dataclass(frozen=True, slots=True)
+class DeadLetterRecord:
+    id: str
+    run_id: str
+    step_id: str
+    attempt_id: str
+    reason_code: str
+    created_at: datetime
+    redriven_run_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class EventRecord:
     sequence: int
     type: str
@@ -107,6 +118,20 @@ class ToolGateway(Protocol):
 
 
 class RunRepository(Protocol):
+    async def list_dead_letters(
+        self, principal: PrincipalContext, run_id: str, after_id: str = "", limit: int = 100
+    ) -> list[DeadLetterRecord]: ...
+
+    async def redrive_dead_letter(
+        self,
+        principal: PrincipalContext,
+        run_id: str,
+        item_id: str,
+        *,
+        idempotency_key: str,
+        reason: str,
+    ) -> AcceptedRun: ...
+
     async def accept_run(
         self, *, command: CreateRunCommand, idempotency_key: str
     ) -> AcceptedRun: ...

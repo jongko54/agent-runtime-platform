@@ -2,7 +2,7 @@
 
 에이전트 실행을 접수하고, 모델 판단과 도구 호출을 별도 worker에서 실행하며 결과를 PostgreSQL에 저장하는 Python 런타임입니다. 엔터프라이즈 운영을 목표로 단계적으로 구현합니다.
 
-> 현재 상태: Phase 2b. lease·복구에 Tool effect 기록, idempotent mock provider, 취소·결과 조정 API를 추가했습니다. 실제 외부 provider의 exactly-once 보장이나 운영 배포 완료를 뜻하지 않습니다. 운영용 인증·실제 LLM/GPU 연동은 아직 없습니다.
+> 현재 상태: Phase 2c. 권한 기반 DLQ 조회와 안전 조건을 만족한 실패의 명시적 redrive를 추가했습니다. 원본 실패 이력을 보존하고 새 Run으로 시작합니다. 실제 외부 provider의 exactly-once 보장이나 운영 배포 완료를 뜻하지 않습니다. 운영용 인증·실제 LLM/GPU 연동은 아직 없습니다.
 
 ## 로컬 실행
 
@@ -47,6 +47,8 @@ curl -N http://127.0.0.1:8000/v1/runs/<run_id>/events/stream \
 
 기존 설치는 [Phase 2b migration 경계](docs/implementation/phase-2b.md#migration과-운영-제약)를 먼저 확인합니다. 실행 중 작업·미확정 효과가 있으면 migration이 거부될 수 있습니다. 기존 데이터베이스에는 자동으로 migration하지 않습니다.
 
+실패한 작업의 수동 재실행은 [Phase 2c DLQ 운영 절차](docs/implementation/phase-2c.md)를 따릅니다. `OUTCOME_UNKNOWN`은 redrive할 수 없습니다.
+
 ## 검증
 
 ```bash
@@ -59,7 +61,7 @@ docker compose config --quiet
 
 통합 테스트는 Docker에 **별도 폐기 가능한 PostgreSQL**을 생성합니다. 기존 DB에서 테스트를 실행하거나 Docker 부재 시 SQLite로 대체하지 않습니다. CI도 같은 명령으로 검사합니다.
 
-100건 동시 idempotency 접수, schema·상태 전이, 실제 non-superuser RLS, Project 권한, 별도 API·worker 프로세스, 병렬 worker, SIGKILL 복구, stale commit 거부, 취소/dispatch 경합, provider 결과 재사용, SSE 재접속을 검사합니다. 범위와 제약은 [Phase 2b 구현 현황](docs/implementation/phase-2b.md)에 기록합니다.
+100건 동시 idempotency 접수, schema·상태 전이, 실제 non-superuser RLS, Project 권한, 별도 API·worker 프로세스, 병렬 worker, SIGKILL 복구, stale commit 거부, 취소/dispatch 경합, provider 결과 재사용, SSE 재접속, DLQ redrive 원자성·권한을 검사합니다. 최신 범위와 제약은 [Phase 2c 구현 현황](docs/implementation/phase-2c.md)에 기록합니다.
 
 ## 설계 문서
 
@@ -71,6 +73,8 @@ docker compose config --quiet
 - [Phase 2a 실행 계획](docs/superpowers/plans/2026-09-13-phase-2a-recovery.md)
 - [Phase 2b Tool 효과·취소·조정](docs/implementation/phase-2b.md)
 - [Phase 2b 실행 계획](docs/superpowers/plans/2026-09-13-phase-2b-effects-cancellation.md)
+- [Phase 2c DLQ 조회·권한 기반 redrive](docs/implementation/phase-2c.md)
+- [Phase 2c 실행 계획](docs/superpowers/plans/2026-09-13-phase-2c-dlq-redrive.md)
 - [AI 모델 릴리스 Agent 예제 패키지](examples/ai-model-release/README.md)
 
 ## 이후 달성할 운영 목표
@@ -126,7 +130,8 @@ API와 worker는 같은 Python package를 공유하지만 별도 process로 실�
 
 - [x] Step checkpoint와 저장된 다음 Work부터 자동 복구
 - [x] mock retry, exponential backoff, dead-letter 기록
-- [ ] 수동 pause/resume, 권한 기반 DLQ redrive
+- [x] 권한 기반 DLQ redrive (전송 이력 없는 실패만 새 Run으로 시작)
+- [ ] 수동 pause/resume, 동일 Run checkpoint redrive
 - [x] Run 접수 idempotency key와 mock 도구 호출 기록
 - [x] Tool effect 원장·mock provider idempotency·결과 조정 API
 - [ ] 실제 외부 provider의 중복 제거 기간·결과 조회 계약 적용

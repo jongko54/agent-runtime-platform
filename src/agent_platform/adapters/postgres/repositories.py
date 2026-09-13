@@ -26,6 +26,7 @@ from agent_platform.application.ports import (
     AcceptedRun,
     ClaimedWork,
     CreateRunCommand,
+    DeadLetterRecord,
     EffectDispatch,
     EventRecord,
     PrincipalContext,
@@ -150,52 +151,7 @@ class PostgresRunRepository:
             raise InvalidInput("Idempotency key must contain 1 to 200 characters")
         principal = command.principal
         async with unit_of_work(self.engine, principal.tenant_id, principal.principal_id) as conn:
-            agent = (
-                (
-                    await conn.execute(
-                        text("""
-                SELECT * FROM agent_versions WHERE tenant_id=:tenant AND id=:id
-            """),
-                        {"tenant": principal.tenant_id, "id": command.agent_version_id},
-                    )
-                )
-                .mappings()
-                .one_or_none()
-            )
-            if agent is None or not await _scope(
-                conn, principal.tenant_id, str(agent["project_id"]), principal.principal_id
-            ):
-                raise ExecutionScopeNotFound()
-            spec = cast(dict[str, Any], agent["spec"])
-            if any(
-                spec.get(field) is not None
-                for field in ("execution_policy", "approval_policy", "compensation_policy")
-            ):
-                raise PolicyDenied("Agent policies are not supported in Phase 1")
-            if spec.get("model_route") != "mock/release-planner-v1":
-                raise PolicyDenied("Phase 1 permits the registered mock model only")
-            for reference in spec["tools"]:
-                name, separator, version = str(reference).rpartition(":v")
-                if not separator or not version.isdigit():
-                    raise PolicyDenied("Invalid registered tool version")
-                registered = (
-                    await conn.execute(
-                        text("""
-                    SELECT 1 FROM tool_versions WHERE tenant_id=:tenant AND project_id=:project
-                     AND name=:name AND version=:version
-                     AND connection_kind='mock' AND risk_tier='T1'
-                """),
-                        {
-                            "tenant": principal.tenant_id,
-                            "project": agent["project_id"],
-                            "name": name,
-                            "version": int(version),
-                        },
-                    )
-                ).first()
-                if registered is None:
-                    raise PolicyDenied("Phase 1 permits registered T1 mock tools only")
-            validate_payload(command.input, spec["input_schema"])
+            agent = await self._validate_acceptance(conn, command)
             digest = canonical_digest(
                 {"agent_version_id": command.agent_version_id, "input": command.input}
             )
@@ -244,47 +200,280 @@ class PostgresRunRepository:
                     .one()
                 )
                 return AcceptedRun(_record(run), duplicate=True)
-            run = (
+            run = await self._create_run(conn, command, agent, run_id)
+            return AcceptedRun(_record(run), duplicate=False)
+
+    async def _validate_acceptance(
+        self, conn: AsyncConnection, command: CreateRunCommand
+    ) -> RowMapping:
+        principal = command.principal
+        agent = (
+            (
+                await conn.execute(
+                    text("""
+            SELECT * FROM agent_versions WHERE tenant_id=:tenant AND id=:id
+        """),
+                    {"tenant": principal.tenant_id, "id": command.agent_version_id},
+                )
+            )
+            .mappings()
+            .one_or_none()
+        )
+        if agent is None or not await _scope(
+            conn, principal.tenant_id, str(agent["project_id"]), principal.principal_id
+        ):
+            raise ExecutionScopeNotFound()
+        spec = cast(dict[str, Any], agent["spec"])
+        if any(
+            spec.get(field) is not None
+            for field in ("execution_policy", "approval_policy", "compensation_policy")
+        ):
+            raise PolicyDenied("Agent policies are not supported in Phase 1")
+        if spec.get("model_route") != "mock/release-planner-v1":
+            raise PolicyDenied("Phase 1 permits the registered mock model only")
+        for reference in spec["tools"]:
+            name, separator, version = str(reference).rpartition(":v")
+            if not separator or not version.isdigit():
+                raise PolicyDenied("Invalid registered tool version")
+            registered = (
+                await conn.execute(
+                    text("""
+                SELECT 1 FROM tool_versions WHERE tenant_id=:tenant AND project_id=:project
+                  AND name=:name AND version=:version AND connection_kind='mock' AND risk_tier='T1'
+            """),
+                    {
+                        "tenant": principal.tenant_id,
+                        "project": agent["project_id"],
+                        "name": name,
+                        "version": int(version),
+                    },
+                )
+            ).first()
+            if registered is None:
+                raise PolicyDenied("Phase 1 permits registered T1 mock tools only")
+        validate_payload(command.input, spec["input_schema"])
+        return agent
+
+    async def _create_run(
+        self, conn: AsyncConnection, command: CreateRunCommand, agent: RowMapping, run_id: str
+    ) -> RowMapping:
+        scope = {
+            "tenant": command.principal.tenant_id,
+            "project": agent["project_id"],
+            "principal": command.principal.principal_id,
+        }
+        run = (
+            (
+                await conn.execute(
+                    text("""
+            INSERT INTO runs(id,tenant_id,project_id,principal_id,agent_version_id,
+                             state,state_version,input)
+            VALUES(:id,:tenant,:project,:principal,:agent,'QUEUED',1,CAST(:input AS jsonb))
+            RETURNING *
+        """),
+                    {
+                        **scope,
+                        "id": run_id,
+                        "agent": command.agent_version_id,
+                        "input": _json(command.input),
+                    },
+                )
+            )
+            .mappings()
+            .one()
+        )
+        await self._create_step(conn, run, uuid4().hex, 1, "MODEL_CALL", command.input)
+        await conn.execute(
+            text("""
+            INSERT INTO run_events
+              (tenant_id,project_id,run_id,sequence,type,schema_version,actor,payload)
+            VALUES(:tenant,:project,:run,1,'RUN_ACCEPTED',1,:principal,CAST(:payload AS jsonb))
+        """),
+            {
+                **scope,
+                "run": run_id,
+                "payload": _json(
+                    {
+                        "state": "QUEUED",
+                        "agent_version_id": command.agent_version_id,
+                        "principal_id": command.principal.principal_id,
+                    }
+                ),
+            },
+        )
+        return run
+
+    async def list_dead_letters(
+        self, principal: PrincipalContext, run_id: str, after_id: str = "", limit: int = 100
+    ) -> list[DeadLetterRecord]:
+        if len(after_id) > 64 or not 1 <= limit <= 100:
+            raise InvalidInput("Invalid dead-letter cursor or page size")
+        async with unit_of_work(self.engine, principal.tenant_id, principal.principal_id) as conn:
+            await self._authorized_run(conn, principal, run_id)
+            rows = (
                 (
                     await conn.execute(
                         text("""
-                INSERT INTO runs (id,tenant_id,project_id,principal_id,agent_version_id,
-                                  state,state_version,input)
-                VALUES (:id,:tenant,:project,:principal,:agent,'QUEUED',1,CAST(:input AS jsonb))
-                RETURNING *
+                SELECT d.id,d.run_id,d.step_id,d.attempt_id,d.reason_code,d.created_at,
+                  r.new_run_id AS redriven_run_id FROM dead_letter_items d
+                LEFT JOIN dead_letter_redrives r ON r.source_dead_letter_id=d.id
+                  AND r.tenant_id=d.tenant_id AND r.project_id=d.project_id
+                WHERE d.tenant_id=:tenant AND d.run_id=:run AND d.id>:after
+                ORDER BY d.id LIMIT :limit
             """),
                         {
-                            "id": run_id,
-                            **scope,
-                            "agent": command.agent_version_id,
-                            "input": _json(command.input),
+                            "tenant": principal.tenant_id,
+                            "run": run_id,
+                            "after": after_id,
+                            "limit": limit,
                         },
                     )
                 )
                 .mappings()
-                .one()
+                .all()
             )
-            step_id = uuid4().hex
-            await self._create_step(conn, run, step_id, 1, "MODEL_CALL", command.input)
+            return [DeadLetterRecord(**dict(row)) for row in rows]
+
+    async def redrive_dead_letter(
+        self,
+        principal: PrincipalContext,
+        run_id: str,
+        item_id: str,
+        *,
+        idempotency_key: str,
+        reason: str,
+    ) -> AcceptedRun:
+        if not idempotency_key.strip() or len(idempotency_key) > 200:
+            raise InvalidInput("Idempotency key must contain 1 to 200 characters")
+        if reason not in {"WORKER_RECOVERED", "TRANSIENT_FAILURE_RESOLVED"}:
+            raise InvalidInput("Unsupported redrive reason")
+        while True:
+            try:
+                async with unit_of_work(
+                    self.engine, principal.tenant_id, principal.principal_id
+                ) as conn:
+                    source = await self._locked_run(conn, principal, run_id)
+                    item = (
+                        (
+                            await conn.execute(
+                                text("""
+                        SELECT d.*,w.status AS work_status FROM dead_letter_items d
+                        JOIN work_items w ON w.id=d.work_id AND w.run_id=d.run_id
+                        WHERE d.tenant_id=:tenant AND d.run_id=:run AND d.id=:item
+                    """),
+                                {"tenant": principal.tenant_id, "run": run_id, "item": item_id},
+                            )
+                        )
+                        .mappings()
+                        .one_or_none()
+                    )
+                    if item is None:
+                        raise ExecutionScopeNotFound()
+                    previous = (
+                        (
+                            await conn.execute(
+                                text("""
+                        SELECT * FROM dead_letter_redrives WHERE source_dead_letter_id=:item
+                    """),
+                                {"item": item_id},
+                            )
+                        )
+                        .mappings()
+                        .one_or_none()
+                    )
+                    if previous is not None:
+                        if (
+                            previous["principal_id"] != principal.principal_id
+                            or previous["idempotency_key"] != idempotency_key
+                            or previous["reason"] != reason
+                        ):
+                            raise IdempotencyConflict("Dead letter already has a redrive")
+                        child = await self._authorized_run(
+                            conn, principal, str(previous["new_run_id"])
+                        )
+                        return AcceptedRun(_record(child), duplicate=True)
+                    await self._validate_redrive(conn, source, item)
+                    command = CreateRunCommand(
+                        principal,
+                        str(source["agent_version_id"]),
+                        cast(dict[str, Any], source["input"]),
+                    )
+                    agent = await self._validate_acceptance(conn, command)
+                    child = await self._create_run(conn, command, agent, uuid4().hex)
+                    link = (
+                        await conn.execute(
+                            text("""
+                        INSERT INTO dead_letter_redrives
+                          (id,tenant_id,project_id,source_run_id,source_dead_letter_id,new_run_id,
+                           principal_id,idempotency_key,reason)
+                        VALUES(:id,:tenant,:project,:source,:item,:child,:principal,:key,:reason)
+                        ON CONFLICT DO NOTHING RETURNING id
+                    """),
+                            {
+                                "id": uuid4().hex,
+                                "tenant": principal.tenant_id,
+                                "project": source["project_id"],
+                                "source": run_id,
+                                "item": item_id,
+                                "child": child["id"],
+                                "principal": principal.principal_id,
+                                "key": idempotency_key,
+                                "reason": reason,
+                            },
+                        )
+                    ).first()
+                    if link is None:
+                        # The DLQ lock serializes identical-source requests. A conflict
+                        # here means this scoped key belongs to another source operation.
+                        # Raising rolls back the provisional child and its initial Work.
+                        raise IdempotencyConflict("Redrive key was used for another request")
+                    payload = {
+                        "source_run_id": run_id,
+                        "source_dead_letter_id": item_id,
+                        "new_run_id": child["id"],
+                        "reason": reason,
+                    }
+                    await _event(
+                        conn, source, None, "DEAD_LETTER_REDRIVEN", principal.principal_id, payload
+                    )
+                    child = await _event(
+                        conn, child, None, "RUN_REDRIVEN", principal.principal_id, payload
+                    )
+                    return AcceptedRun(_record(child), duplicate=False)
+            except _WorkSetChanged:
+                continue
+
+    async def _validate_redrive(
+        self, conn: AsyncConnection, source: RowMapping, item: RowMapping
+    ) -> None:
+        error = cast(dict[str, Any], source["error"] or {})
+        if (
+            source["state"] != "FAILED"
+            or source["cancel_epoch"]
+            or error.get("code") != "RETRY_EXHAUSTED"
+            or item["reason_code"] != "RETRY_EXHAUSTED"
+            or item["work_status"] != "FAILED"
+        ):
+            raise RuntimeConflict("Dead letter is not eligible for redrive")
+        unsafe = (
             await conn.execute(
                 text("""
-                INSERT INTO run_events
-                  (tenant_id,project_id,run_id,sequence,type,schema_version,actor,payload)
-                VALUES (:tenant,:project,:run,1,'RUN_ACCEPTED',1,:principal,CAST(:payload AS jsonb))
-            """),
-                {
-                    **scope,
-                    "run": run_id,
-                    "payload": _json(
-                        {
-                            "state": "QUEUED",
-                            "agent_version_id": command.agent_version_id,
-                            "principal_id": principal.principal_id,
-                        }
-                    ),
-                },
+            SELECT 1 WHERE EXISTS(SELECT 1 FROM work_items WHERE run_id=:run
+              AND status IN ('READY','PROCESSING','OUTCOME_UNKNOWN'))
+            OR EXISTS(SELECT 1 FROM tool_effects WHERE run_id=:run
+              AND (dispatch_token IS NOT NULL OR status IN
+                ('DISPATCHED','SUCCEEDED','OUTCOME_UNKNOWN')))
+            OR EXISTS(SELECT 1 FROM tool_calls WHERE run_id=:run
+              AND (status IN ('DISPATCHED','SUCCEEDED','OUTCOME_UNKNOWN') OR result IS NOT NULL))
+            OR EXISTS(SELECT 1 FROM run_events WHERE run_id=:run AND type='TOOL_DISPATCHED')
+            OR EXISTS(SELECT 1 FROM model_calls WHERE run_id=:run
+              AND model_route<>'mock/release-planner-v1')
+        """),
+                {"run": source["id"]},
             )
-            return AcceptedRun(_record(run), duplicate=False)
+        ).first()
+        if unsafe is not None:
+            raise RuntimeConflict("Run has active work or an unsafe execution history")
 
     async def get_run(self, principal: PrincipalContext, run_id: str) -> RunRecord:
         async with unit_of_work(self.engine, principal.tenant_id, principal.principal_id) as conn:

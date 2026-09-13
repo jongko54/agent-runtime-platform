@@ -79,6 +79,12 @@ dead_letter_items = _table(
     "id tenant_id project_id run_id step_id work_id attempt_id reason_code",
     dates="created_at",
 )
+dead_letter_redrives = _table(
+    "dead_letter_redrives",
+    "id tenant_id project_id source_run_id source_dead_letter_id new_run_id "
+    "principal_id idempotency_key reason",
+    dates="created_at",
+)
 idempotency_records = _table(
     "idempotency_records", "tenant_id project_id principal_id key request_hash run_id"
 )

@@ -6,7 +6,7 @@ import time
 from collections.abc import AsyncGenerator, AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import asdict
-from typing import Annotated, Any, cast
+from typing import Annotated, Any, Literal, cast
 
 from fastapi import Body, Depends, FastAPI, Header, Query, Request
 from fastapi.encoders import jsonable_encoder
@@ -91,6 +91,11 @@ class CreateRunRequest(BaseModel):
 
 class EmptyMutationRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
+
+class RedriveRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    reason: Literal["WORKER_RECOVERED", "TRANSIENT_FAILURE_RESOLVED"]
 
 
 def public_run(run: RunRecord) -> dict[str, Any]:
@@ -248,6 +253,40 @@ def create_app(
         body: Annotated[EmptyMutationRequest | None, Body()] = None,
     ) -> dict[str, Any]:
         return public_run(await repo.cancel_run(principal, run_id))
+
+    @app.get("/v1/runs/{run_id}/dead-letters")
+    async def list_dead_letters(
+        run_id: str,
+        principal: Principal,
+        repo: Repository,
+        after_id: Annotated[str, Query(max_length=64)] = "",
+        limit: Annotated[int, Query(ge=1, le=100)] = 100,
+    ) -> dict[str, Any]:
+        items = await repo.list_dead_letters(principal, run_id, after_id, limit)
+        return {"items": [asdict(item) for item in items]}
+
+    @app.post("/v1/runs/{run_id}/dead-letters/{item_id}/redrive", status_code=202)
+    async def redrive_dead_letter(
+        run_id: str,
+        item_id: str,
+        body: RedriveRequest,
+        principal: Principal,
+        repo: Repository,
+        idempotency_key: Annotated[str, Header(min_length=1, max_length=200)],
+    ) -> dict[str, Any]:
+        if not idempotency_key.strip():
+            raise InvalidInput("Invalid idempotency key")
+        accepted = await repo.redrive_dead_letter(
+            principal, run_id, item_id, idempotency_key=idempotency_key, reason=body.reason
+        )
+        return {
+            "run_id": accepted.run.id,
+            "source_run_id": run_id,
+            "dead_letter_id": item_id,
+            "project_id": accepted.run.project_id,
+            "state": accepted.run.state,
+            "duplicate": accepted.duplicate,
+        }
 
     @app.post("/v1/runs/{run_id}/reconcile")
     async def reconcile_run(

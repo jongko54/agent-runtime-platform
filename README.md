@@ -2,7 +2,7 @@
 
 에이전트 실행을 접수하고, 모델 판단과 도구 호출을 별도 worker에서 실행하며 결과를 PostgreSQL에 저장하는 Python 런타임입니다. 엔터프라이즈 운영을 목표로 단계적으로 구현합니다.
 
-> 현재 상태: Phase 2c. 권한 기반 DLQ 조회와 안전 조건을 만족한 실패의 명시적 redrive를 추가했습니다. 원본 실패 이력을 보존하고 새 Run으로 시작합니다. 실제 외부 provider의 exactly-once 보장이나 운영 배포 완료를 뜻하지 않습니다. 운영용 인증·실제 LLM/GPU 연동은 아직 없습니다.
+> 현재 상태: Phase 3a. metadata-only 실행 trace 조회와 출처가 고정된 DRAFT 평가 후보 저장을 추가했습니다. 실제 OTel 전송·자동 평가·승인된 데이터셋은 아직 없습니다. 운영용 인증·실제 LLM/GPU 연동과 운영 배포도 아직 없습니다.
 
 ## 로컬 실행
 
@@ -49,6 +49,8 @@ curl -N http://127.0.0.1:8000/v1/runs/<run_id>/events/stream \
 
 실패한 작업의 수동 재실행은 [Phase 2c DLQ 운영 절차](docs/implementation/phase-2c.md)를 따릅니다. `OUTCOME_UNKNOWN`은 redrive할 수 없습니다.
 
+실행 이력과 검토 전 평가 후보는 [Phase 3a 관측 API](docs/implementation/phase-3a.md)를 사용합니다. trace에는 입력·응답·도구 인자 원문을 포함하지 않습니다.
+
 ## 검증
 
 ```bash
@@ -61,7 +63,7 @@ docker compose config --quiet
 
 통합 테스트는 Docker에 **별도 폐기 가능한 PostgreSQL**을 생성합니다. 기존 DB에서 테스트를 실행하거나 Docker 부재 시 SQLite로 대체하지 않습니다. CI도 같은 명령으로 검사합니다.
 
-100건 동시 idempotency 접수, schema·상태 전이, 실제 non-superuser RLS, Project 권한, 별도 API·worker 프로세스, 병렬 worker, SIGKILL 복구, stale commit 거부, 취소/dispatch 경합, provider 결과 재사용, SSE 재접속, DLQ redrive 원자성·권한을 검사합니다. 최신 범위와 제약은 [Phase 2c 구현 현황](docs/implementation/phase-2c.md)에 기록합니다.
+100건 동시 idempotency 접수, schema·상태 전이, 실제 non-superuser RLS, Project 권한, 별도 API·worker 프로세스, 병렬 worker, SIGKILL 복구, stale commit 거부, 취소/dispatch 경합, provider 결과 재사용, SSE 재접속, DLQ redrive 원자성·권한을 검사합니다. Phase 3a에서는 trace 원문 배제·연결 완전성과 평가 후보 snapshot·권한·멱등성을 검사합니다. 최신 범위와 제약은 [Phase 3a 구현 현황](docs/implementation/phase-3a.md)에 기록합니다.
 
 ## 설계 문서
 
@@ -75,6 +77,8 @@ docker compose config --quiet
 - [Phase 2b 실행 계획](docs/superpowers/plans/2026-09-13-phase-2b-effects-cancellation.md)
 - [Phase 2c DLQ 조회·권한 기반 redrive](docs/implementation/phase-2c.md)
 - [Phase 2c 실행 계획](docs/superpowers/plans/2026-09-13-phase-2c-dlq-redrive.md)
+- [Phase 3a durable trace·평가 후보](docs/implementation/phase-3a.md)
+- [Phase 3a 실행 계획](docs/superpowers/plans/2026-09-14-phase-3a-trace-evaluation.md)
 - [AI 모델 릴리스 Agent 예제 패키지](examples/ai-model-release/README.md)
 
 ## 이후 달성할 운영 목표
@@ -154,8 +158,11 @@ API와 worker는 같은 Python package를 공유하지만 별도 process로 실�
 
 ### 5. 추적과 품질 운영
 
+- [x] metadata-only durable trace 조회와 기본 실패 분류
+- [x] source version·redaction provenance가 고정된 DRAFT 평가 후보
 - [ ] OpenTelemetry 기반 run trace 연결
-- [ ] prompt/model/tool 버전 기록
+- [x] 저장된 Agent/Tool version·schema fingerprint·mock model route 조회
+- [ ] 독립 prompt/runtime build·실 provider model revision 기록
 - [ ] redaction, sampling, retention 정책 구현
 - [ ] 실패 trace를 회귀 평가 데이터셋으로 전환
 

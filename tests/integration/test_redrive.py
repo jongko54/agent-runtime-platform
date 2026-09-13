@@ -456,11 +456,11 @@ async def test_redrive_migration_preserves_legacy_dlq_and_refuses_history_loss()
                 before = (
                     await conn.execute(text("SELECT to_jsonb(d) FROM dead_letter_items d"))
                 ).scalar_one()
-            migration_command.upgrade(config, "head")
+            migration_command.upgrade(config, "0004")
             items = await repo.list_dead_letters(seed.principal, run.run.id)
             assert len(items) == 1 and items[0].id == before["id"]
             migration_command.downgrade(config, "0003")
-            migration_command.upgrade(config, "head")
+            migration_command.upgrade(config, "0004")
             await repo.redrive_dead_letter(
                 seed.principal,
                 run.run.id,

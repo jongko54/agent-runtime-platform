@@ -24,10 +24,12 @@ from agent_platform.application.errors import (
     IdempotencyConflict,
     IdentityProviderNotConfigured,
     InvalidInput,
+    ObservationUnavailable,
     PolicyDenied,
     ProviderUnavailable,
     RuntimeConflict,
 )
+from agent_platform.application.observability import ObservationRepository
 from agent_platform.application.ports import (
     CreateRunCommand,
     IdentityVerifier,
@@ -98,6 +100,12 @@ class RedriveRequest(BaseModel):
     reason: Literal["WORKER_RECOVERED", "TRANSIENT_FAILURE_RESOLVED"]
 
 
+class EvaluationCandidateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    source_state_version: int = Field(ge=1, strict=True)
+    expected_state: Literal["COMPLETED", "FAILED", "CANCELLED", "TIMED_OUT", "REJECTED"]
+
+
 def public_run(run: RunRecord) -> dict[str, Any]:
     return {
         "run_id": run.id,
@@ -134,8 +142,16 @@ def repository_for(request: Request) -> RunRepository:
     return cast(RunRepository, request.app.state.repository)
 
 
+def observations_for(request: Request) -> ObservationRepository:
+    observations = cast(ObservationRepository | None, request.app.state.observations)
+    if observations is None:
+        raise ObservationUnavailable()
+    return observations
+
+
 Principal = Annotated[PrincipalContext, Depends(authenticate)]
 Repository = Annotated[RunRepository, Depends(repository_for)]
+Observations = Annotated[ObservationRepository, Depends(observations_for)]
 
 
 def create_app(
@@ -143,6 +159,7 @@ def create_app(
     repository: RunRepository | None = None,
     identity_verifier: IdentityVerifier | None = None,
     tool_gateway: ToolGateway | None = None,
+    observations: ObservationRepository | None = None,
 ) -> FastAPI:
     configuration = settings or Settings()
 
@@ -155,6 +172,12 @@ def create_app(
 
             engine = create_engine(configuration.database_url)
             application.state.repository = PostgresRunRepository(engine)
+            if observations is None:
+                from agent_platform.adapters.postgres.observations import (
+                    PostgresObservationRepository,
+                )
+
+                application.state.observations = PostgresObservationRepository(engine)
             if tool_gateway is None:
                 from agent_platform.adapters.tools.persistent_mock import (
                     PersistentMockEvaluationTool,
@@ -172,6 +195,7 @@ def create_app(
     app.state.repository = repository
     app.state.identity_verifier = identity_verifier
     app.state.tool_gateway = tool_gateway
+    app.state.observations = observations
     if identity_verifier is None and configuration.development_mode:
         secret = configuration.development_token
         if secret is not None and secret.get_secret_value():
@@ -197,6 +221,7 @@ def create_app(
             InvalidInput: (422, "Request payload is invalid"),
             PolicyDenied: (403, "Operation is not permitted"),
             ProviderUnavailable: (503, "Provider result lookup is unavailable"),
+            ObservationUnavailable: (503, "Observation storage is unavailable"),
         }
         status_code, message = error_mapping.get(type(exc), (500, "Request could not be processed"))
         return error_response(exc.code, message, status_code)
@@ -253,6 +278,41 @@ def create_app(
         body: Annotated[EmptyMutationRequest | None, Body()] = None,
     ) -> dict[str, Any]:
         return public_run(await repo.cancel_run(principal, run_id))
+
+    @app.get("/v1/runs/{run_id}/trace")
+    async def get_trace(run_id: str, principal: Principal, store: Observations) -> dict[str, Any]:
+        return await store.get_trace(principal, run_id)
+
+    @app.post("/v1/runs/{run_id}/evaluation-candidates", status_code=201)
+    async def create_evaluation_candidate(
+        run_id: str,
+        body: EvaluationCandidateRequest,
+        principal: Principal,
+        store: Observations,
+        idempotency_key: Annotated[str, Header(min_length=1, max_length=200)],
+    ) -> JSONResponse:
+        if not idempotency_key.strip():
+            raise InvalidInput("Invalid idempotency key")
+        accepted = await store.create_evaluation_candidate(
+            principal,
+            run_id,
+            source_state_version=body.source_state_version,
+            expected_state=body.expected_state,
+            idempotency_key=idempotency_key,
+        )
+        return JSONResponse(
+            jsonable_encoder(asdict(accepted)), status_code=200 if accepted.duplicate else 201
+        )
+
+    @app.get("/v1/evaluation-candidates/{candidate_id}")
+    async def get_evaluation_candidate(
+        candidate_id: str, principal: Principal, store: Observations
+    ) -> dict[str, Any]:
+        # Use the same timestamp representation as create/duplicate responses.
+        return cast(
+            dict[str, Any],
+            jsonable_encoder(asdict(await store.get_evaluation_candidate(principal, candidate_id))),
+        )
 
     @app.get("/v1/runs/{run_id}/dead-letters")
     async def list_dead_letters(

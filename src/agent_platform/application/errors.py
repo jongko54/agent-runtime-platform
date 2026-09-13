@@ -44,3 +44,7 @@ class RuntimeConflict(ApplicationError):
 
 class ProviderUnavailable(ApplicationError):
     code = "PROVIDER_UNAVAILABLE"
+
+
+class ObservationUnavailable(ApplicationError):
+    code = "OBSERVATION_UNAVAILABLE"

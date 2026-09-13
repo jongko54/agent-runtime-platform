@@ -1,0 +1,14 @@
+{
+  "instructions_ref": "content://ai-model-release-agent/v1",
+  "model_route": "mock/release-planner-v1",
+  "tools": ["evaluation.run_suite:v1"],
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "candidate_model_ref": {"type": "string", "minLength": 1},
+      "evaluation_suite_ref": {"type": "string", "minLength": 1}
+    },
+    "required": ["candidate_model_ref", "evaluation_suite_ref"],
+    "additionalProperties": false
+  }
+}

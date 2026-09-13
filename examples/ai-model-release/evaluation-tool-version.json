@@ -1,0 +1,27 @@
+{
+  "name": "evaluation.run_suite",
+  "version": 1,
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "candidate_model_ref": {"type": "string", "minLength": 1},
+      "evaluation_suite_ref": {"type": "string", "minLength": 1}
+    },
+    "required": ["candidate_model_ref", "evaluation_suite_ref"],
+    "additionalProperties": false
+  },
+  "output_schema": {
+    "type": "object",
+    "properties": {
+      "decision": {"const": "EVALUATED"},
+      "candidate_model_ref": {"type": "string", "minLength": 1},
+      "evaluation_suite_ref": {"type": "string", "minLength": 1},
+      "quality_score": {"type": "number", "minimum": 0, "maximum": 1},
+      "safety_score": {"type": "number", "minimum": 0, "maximum": 1}
+    },
+    "required": ["decision", "candidate_model_ref", "evaluation_suite_ref", "quality_score", "safety_score"],
+    "additionalProperties": false
+  },
+  "risk_tier": "T1",
+  "connection_kind": "mock"
+}

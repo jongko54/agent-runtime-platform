@@ -1,5 +1,7 @@
 # Phase 0·1 Python Agent Runtime Implementation Plan
 
+> 2026-09-13 구현 추가: 아래 체크박스·코드 조각은 최초 실행 계획의 기록이다. 현재 파일명, 실제 실행 명령, 지원 기능과 검증 범위는 [Phase 0·1 구현 현황](../../implementation/phase-0-1.md)과 [README](../../../README.md)를 따른다. 특히 아래 downgrade 명령은 데이터를 제거하므로 기존 사용자 DB에서 실행하지 않는다.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Python으로 멀티테넌트 Agent Platform의 Contract·Invariant와 요청 → mock model 판단 → 단일 mock Tool 실행 → 결과 저장 vertical slice를 구현한다.
@@ -374,12 +376,8 @@ ALLOWED_TRANSITIONS: dict[RunState, frozenset[RunState]] = {
     RunState.WAITING_APPROVAL: frozenset(
         {RunState.RUNNING, RunState.REJECTED, RunState.CANCEL_REQUESTED}
     ),
-    RunState.PAUSED: frozenset(
-        {RunState.QUEUED, RunState.CANCEL_REQUESTED}
-    ),
-    RunState.CANCEL_REQUESTED: frozenset(
-        {RunState.CANCELLED, RunState.OUTCOME_UNKNOWN}
-    ),
+    RunState.PAUSED: frozenset({RunState.QUEUED, RunState.CANCEL_REQUESTED}),
+    RunState.CANCEL_REQUESTED: frozenset({RunState.CANCELLED, RunState.OUTCOME_UNKNOWN}),
     RunState.OUTCOME_UNKNOWN: frozenset(
         {RunState.QUEUED, RunState.COMPLETED, RunState.FAILED, RunState.CANCELLED}
     ),
@@ -420,9 +418,7 @@ from agent_platform.domain.states import RunState
 
 
 @given(st.sampled_from(tuple(TERMINAL_STATES)), st.sampled_from(tuple(RunState)))
-def test_terminal_states_have_no_outgoing_transition(
-    current: RunState, target: RunState
-) -> None:
+def test_terminal_states_have_no_outgoing_transition(current: RunState, target: RunState) -> None:
     from agent_platform.domain.runs import ALLOWED_TRANSITIONS
 
     assert target not in ALLOWED_TRANSITIONS.get(current, frozenset())
@@ -890,7 +886,9 @@ runs = Table(
     Column("updated_at", DateTime(timezone=True), server_default=func.now(), nullable=False),
     UniqueConstraint("tenant_id", "id"),
     ForeignKeyConstraint(["tenant_id", "project_id"], ["projects.tenant_id", "projects.id"]),
-    ForeignKeyConstraint(["tenant_id", "agent_version_id"], ["agent_versions.tenant_id", "agent_versions.id"]),
+    ForeignKeyConstraint(
+        ["tenant_id", "agent_version_id"], ["agent_versions.tenant_id", "agent_versions.id"]
+    ),
 )
 
 run_steps = Table(
@@ -980,7 +978,9 @@ tool_calls = Table(
     UniqueConstraint("tenant_id", "id"),
     ForeignKeyConstraint(["tenant_id", "run_id"], ["runs.tenant_id", "runs.id"]),
     ForeignKeyConstraint(["tenant_id", "step_id"], ["run_steps.tenant_id", "run_steps.id"]),
-    ForeignKeyConstraint(["tenant_id", "tool_version_id"], ["tool_versions.tenant_id", "tool_versions.id"]),
+    ForeignKeyConstraint(
+        ["tenant_id", "tool_version_id"], ["tool_versions.tenant_id", "tool_versions.id"]
+    ),
 )
 
 usage_entries = Table(
@@ -1089,9 +1089,7 @@ class ApplicationError(Exception):
     code = "APPLICATION_ERROR"
     retryable = False
 
-    def __init__(
-        self, message: str, *, details: Mapping[str, Any] | None = None
-    ) -> None:
+    def __init__(self, message: str, *, details: Mapping[str, Any] | None = None) -> None:
         super().__init__(message)
         self.message = message
         self.details = dict(details or {})
@@ -1262,9 +1260,7 @@ async def test_same_key_and_payload_returns_same_run(run_service, run_command) -
 
 
 @pytest.mark.asyncio
-async def test_same_key_with_different_payload_conflicts(
-    run_service, run_command
-) -> None:
+async def test_same_key_with_different_payload_conflicts(run_service, run_command) -> None:
     await run_service.accept(run_command, "key-1")
     changed = replace(
         run_command,
@@ -1319,9 +1315,7 @@ class RunService:
         self._id_generator = id_generator
         self._clock = clock
 
-    async def accept(
-        self, command: CreateRunCommand, idempotency_key: str
-    ) -> AcceptedRun:
+    async def accept(self, command: CreateRunCommand, idempotency_key: str) -> AcceptedRun:
         request_hash = canonical_digest(
             {
                 "project_id": command.project_id,
@@ -1394,7 +1388,9 @@ Add these protocols to `application/ports.py`:
 
 ```python
 class ModelGateway(Protocol):
-    async def decide(self, *, input: dict[str, Any], allowed_tools: tuple[str, ...]) -> dict[str, Any]: ...
+    async def decide(
+        self, *, input: dict[str, Any], allowed_tools: tuple[str, ...]
+    ) -> dict[str, Any]: ...
 
 
 class ToolGateway(Protocol):
@@ -1524,9 +1520,7 @@ async def test_reused_key_with_different_payload_returns_409(client) -> None:
     }
     await client.post("/v1/runs", headers=headers, json=first)
     first["input"]["candidate_model_ref"] = "mock://candidate-18"
-    response = await client.post(
-        "/v1/runs", headers=headers, json=first
-    )
+    response = await client.post("/v1/runs", headers=headers, json=first)
     assert response.status_code == 409
     assert response.json()["error"]["code"] == "IDEMPOTENCY_CONFLICT"
 ```

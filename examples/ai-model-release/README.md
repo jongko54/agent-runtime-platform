@@ -1,6 +1,8 @@
 # AI Model Release Agent 예제 패키지
 
-이 문서는 범용 Agent Runtime Platform 위에 등록할 첫 번째 AI 업무 패키지를 정의한다. 현재 단계에서는 실제 MLflow, GPU benchmark, Kubernetes 배포를 실행하지 않으며, 동일한 계약을 구현한 deterministic mock Tool로 플랫폼의 실행·승인·복구 경계를 검증한다.
+이 문서는 범용 Agent Runtime Platform 위에 등록할 첫 번째 AI 업무 패키지를 정의한다. 실제 MLflow, GPU benchmark, Kubernetes 배포를 실행하지 않는다.
+
+> 현재 실행 가능한 Phase 1 예제는 [agent-version.json](agent-version.json)과 [evaluation-tool-version.json](evaluation-tool-version.json)이며, deterministic mock model → mock 평가 → 결과 저장만 수행한다. 아래 승인·복구·배포 시나리오는 이후 단계의 설계이며 현재 검증 완료한 기능이 아니다. 실행 방법과 제한은 [저장소 README](../../README.md)와 [구현 현황](../../docs/implementation/phase-0-1.md)을 따른다.
 
 ## 1. 경계
 

@@ -4,6 +4,8 @@
 - 작성일: 2026-09-04
 - 적용 범위: Phase 0 Contract·Invariant와 Phase 1 최소 Agent Runtime
 
+> 2026-09-13: Phase 0·1 구현을 추가했다. 현재 지원 범위·검증·설계 대비 조정은 [구현 현황](../../implementation/phase-0-1.md)을 따른다. 아래 PAAR의 Result는 설계상 기대 효과이며 모든 운영 기능의 구현 완료를 뜻하지 않는다.
+
 ## 1. 결정
 
 Agent Runtime Platform의 Phase 0~4는 Python 단일 애플리케이션 스택으로 구현한다.
@@ -126,8 +128,9 @@ Agent Runtime Platform의 Phase 0~4는 Python 단일 애플리케이션 스택�
 - **Approach:** DB 구조 변경을 수동 작업이 아니라 versioned migration으로 관리한다.
 - **Action:** schema 변경은 Alembic migration으로만 반영하고, upgrade와 downgrade를 실제
   PostgreSQL에서 검증한다.
-- **Result:** 개발·CI·배포 환경의 schema를 재현하고, 변경 실패 시 데이터 계약을 보존한 채
-  rollback할 수 있다.
+- **Result:** 개발·CI 환경의 schema를 재현하고 migration의 가역성을 확인한다. 초기 migration의
+  downgrade는 데이터를 제거하므로 운영 데이터 보존 rollback이 아니다. 운영 변경에는 별도
+  expand/contract 전략과 backup·복구 검증이 필요하다.
 
 #### `uv`와 lockfile
 

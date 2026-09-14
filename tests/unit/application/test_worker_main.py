@@ -1,5 +1,5 @@
 import asyncio
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 from uuid import UUID
 
 import pytest
@@ -42,6 +42,42 @@ async def test_worker_configures_fenced_owner_without_session_lock_and_drains_du
     assert poller.poll_once.await_count == 2
     engine.connect.assert_not_called()
     engine.dispose.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_default_worker_does_not_construct_exporter():
+    engine, poller = AsyncMock(), AsyncMock()
+    with (
+        patch("agent_platform.worker.main.create_engine", return_value=engine),
+        patch("agent_platform.worker.main.PostgresRunRepository"),
+        patch("agent_platform.worker.main.WorkerPoller", return_value=poller),
+        patch("agent_platform.worker.main.OtelRuntimeTelemetry") as telemetry_type,
+    ):
+        await run_worker(Settings(_env_file=None), once=True)
+    telemetry_type.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["start", "shutdown", "snapshot", None])
+async def test_worker_telemetry_failure_does_not_change_once_result(failure, caplog):
+    engine, poller, telemetry = AsyncMock(), AsyncMock(), Mock()
+    telemetry.snapshot.return_value = {"ended": 2, "dropped": 0, "SECRET_BAD_KEY": 99}
+    if failure in {"shutdown", "snapshot"}:
+        getattr(telemetry, failure).side_effect = RuntimeError("SECRET")
+    with (
+        patch("agent_platform.worker.main.create_engine", return_value=engine),
+        patch("agent_platform.worker.main.PostgresRunRepository"),
+        patch("agent_platform.worker.main.WorkerPoller", return_value=poller),
+        patch("agent_platform.worker.main.OtelRuntimeTelemetry", return_value=telemetry) as factory,
+    ):
+        if failure == "start":
+            factory.side_effect = RuntimeError("SECRET")
+        await run_worker(Settings(_env_file=None, telemetry_enabled=True), once=True)
+    poller.poll_once.assert_awaited_once()
+    engine.dispose.assert_awaited_once()
+    if failure != "start":
+        telemetry.shutdown.assert_called_once()
+    assert "SECRET" not in caplog.text
 
 
 @pytest.mark.asyncio

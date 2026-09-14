@@ -548,8 +548,8 @@ class PostgresRunRepository:
                     await conn.execute(
                         text("""
                 SELECT w.id,w.tenant_id,w.project_id,w.run_id,w.step_id,s.kind,s.input,
-                       r.principal_id,a.spec AS agent_spec,w.worker_id,w.lease_token,
-                       w.attempt_count AS attempt_no
+                       r.principal_id,r.agent_version_id,a.spec AS agent_spec,
+                       w.worker_id,w.lease_token,w.attempt_count AS attempt_no
                 FROM work_items w JOIN run_steps s ON s.id=w.step_id
                 JOIN runs r ON r.id=w.run_id JOIN agent_versions a ON a.id=r.agent_version_id
                 WHERE w.id=:id AND w.status='PROCESSING' AND s.state='READY'
@@ -757,8 +757,8 @@ class PostgresRunRepository:
                         await conn.execute(
                             text("""
                     SELECT w.id,w.tenant_id,w.project_id,w.run_id,w.step_id,s.kind,s.input,
-                      r.principal_id,a.spec AS agent_spec,w.worker_id,w.lease_token,
-                      w.attempt_count AS attempt_no,x.id AS attempt_id
+                      r.principal_id,r.agent_version_id,a.spec AS agent_spec,
+                      w.worker_id,w.lease_token,w.attempt_count AS attempt_no,x.id AS attempt_id
                     FROM work_items w JOIN run_steps s ON s.id=w.step_id
                     JOIN runs r ON r.id=w.run_id JOIN agent_versions a ON a.id=r.agent_version_id
                     JOIN run_attempts x ON x.work_id=w.id AND x.lease_token=w.lease_token

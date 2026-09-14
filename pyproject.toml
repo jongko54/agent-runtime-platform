@@ -16,6 +16,8 @@ dependencies = [
   "sqlalchemy[asyncio]>=2.0.52,<2.1",
   "uvicorn[standard]>=0.52.4,<1",
   "jsonschema>=4.23,<5",
+  "opentelemetry-sdk==1.44.0",
+  "opentelemetry-exporter-otlp-proto-common==1.44.0",
 ]
 
 [dependency-groups]

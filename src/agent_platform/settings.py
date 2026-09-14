@@ -5,6 +5,8 @@ from typing import Self
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from agent_platform.adapters.telemetry.otel import validate_endpoint
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="AGENT_PLATFORM_", env_file=".env", extra="forbid")
@@ -21,10 +23,21 @@ class Settings(BaseSettings):
     retry_base_seconds: float = Field(default=1, gt=0, le=60)
     sse_poll_interval_seconds: float = Field(default=0.1, gt=0, le=10)
     sse_heartbeat_seconds: float = Field(default=15, gt=0, le=60)
+    telemetry_enabled: bool = False
+    telemetry_endpoint: str = "http://127.0.0.1:4318/v1/traces"
+    telemetry_queue_capacity: int = Field(default=2048, ge=1, le=10000)
+    telemetry_export_timeout_seconds: float = Field(default=1, gt=0, le=10)
+    telemetry_shutdown_timeout_seconds: float = Field(default=2, gt=0, le=10)
     development_mode: bool = False
     development_token: SecretStr | None = None
     development_tenant_id: str = "demo"
     development_principal_id: str = "demo-user"
+
+    @field_validator("telemetry_endpoint")
+    @classmethod
+    def require_local_collector(cls, value: str) -> str:
+        validate_endpoint(value)
+        return value
 
     @field_validator("database_url", "migration_database_url")
     @classmethod

@@ -2,6 +2,8 @@
 
 Phase 2의 저장 이력을 안전하게 관측하는 첫 단계다. worker 실행 코드를 바꾸지 않고 별도 observation repository와 API를 추가한다. 이것은 **DB 이력의 metadata projection**이며 OpenTelemetry exporter, 모델 성능 측정, 자동 평가 완료를 뜻하지 않는다.
 
+후속 [Phase 3b](phase-3b.md)에서 worker OTel span과 로컬 전송을 별도로 추가했다. 아래는 Phase 3a 완료 시점의 계약·검증이며 DRAFT 후보 경계는 그대로 유지한다.
+
 ## Trace 계약
 
 `GET /v1/runs/{run_id}/trace`는 같은 PostgreSQL snapshot에서 다음 관계를 조회한다.

@@ -62,3 +62,39 @@ def test_lease_settings_bounds(field, value):
 def test_short_lease_with_matching_heartbeat_is_supported():
     settings = Settings(_env_file=None, lease_seconds=0.3, heartbeat_interval_seconds=0.05)
     assert settings.lease_seconds == 0.3
+
+
+def test_telemetry_is_disabled_by_default():
+    settings = Settings(_env_file=None)
+    assert settings.telemetry_enabled is False
+    assert settings.telemetry_endpoint == "http://127.0.0.1:4318/v1/traces"
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "https://collector.example/v1/traces",
+        "http://localhost:4318/v1/traces",
+        "http://127.0.0.1:4318/v1/traces?token=SECRET",
+        "http://user:SECRET@127.0.0.1/v1/traces",
+    ],
+)
+def test_telemetry_endpoint_fails_closed(endpoint):
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, telemetry_endpoint=endpoint)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("telemetry_queue_capacity", 0),
+        ("telemetry_queue_capacity", 10001),
+        ("telemetry_export_timeout_seconds", 0),
+        ("telemetry_export_timeout_seconds", float("inf")),
+        ("telemetry_shutdown_timeout_seconds", 0),
+        ("telemetry_shutdown_timeout_seconds", 11),
+    ],
+)
+def test_telemetry_settings_are_bounded(field, value):
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, **{field: value})

@@ -79,6 +79,7 @@ class ClaimedWork:
     attempt_no: int = 1
     lease_token: int = 0
     worker_id: str = ""
+    agent_version_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

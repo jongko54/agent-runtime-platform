@@ -2,7 +2,7 @@
 
 에이전트 실행을 접수하고, 모델 판단과 도구 호출을 별도 worker에서 실행하며 결과를 PostgreSQL에 저장하는 Python 런타임입니다. 엔터프라이즈 운영을 목표로 단계적으로 구현합니다.
 
-> 현재 상태: Phase 3b. metadata-only durable trace·DRAFT 평가 후보에 이어 worker Attempt/Model/Tool의 실제 OTel span과 비차단 로컬 OTLP 전송을 추가했습니다. 기본값은 비활성화입니다. 전체 Run 분산 trace·자동 평가·승인된 데이터셋·운영 인증·실제 LLM/GPU 연동·운영 배포는 아직 없습니다.
+> 현재 상태: Phase 3c. 명시적으로 정제한 불변 평가 case와 mock 모델의 도구 선택·인자 회귀 비교를 추가했습니다. 기존 durable trace·DRAFT 후보와 선택적 로컬 OTel 계측도 유지합니다. DRAFT 자동 승인·전체 Run replay·실제 LLM 품질 평가·운영 인증·GPU 연동·운영 배포는 아직 없습니다.
 
 ## 로컬 실행
 
@@ -53,6 +53,8 @@ curl -N http://127.0.0.1:8000/v1/runs/<run_id>/events/stream \
 
 worker 실시간 계측은 [Phase 3b 로컬 OTel 사용법](docs/implementation/phase-3b.md)을 따릅니다. 수신기 장애·큐 포화 시 관측 데이터는 유실될 수 있으며 PostgreSQL 실행 이력이 기준입니다.
 
+후보에서 별도로 정제한 입력·기대 도구 호출을 등록하고 비교하려면 [Phase 3c case·오프라인 평가 API](docs/implementation/phase-3c.md)를 사용합니다. 도구나 원래 Run은 재실행하지 않습니다. 기존 DB에는 `0006` migration이 필요하지만 자동 적용하지 않습니다.
+
 ## 검증
 
 ```bash
@@ -65,7 +67,7 @@ docker compose config --quiet
 
 통합 테스트는 Docker에 **별도 폐기 가능한 PostgreSQL**을 생성합니다. 기존 DB에서 테스트를 실행하거나 Docker 부재 시 SQLite로 대체하지 않습니다. CI도 같은 명령으로 검사합니다.
 
-100건 동시 idempotency 접수, schema·상태 전이, 실제 non-superuser RLS, Project 권한, 별도 API·worker 프로세스, 병렬 worker, SIGKILL 복구, stale commit 거부, 취소/dispatch 경합, provider 결과 재사용, SSE 재접속, DLQ redrive 원자성·권한을 검사합니다. Phase 3a에서는 trace 원문 배제·연결 완전성과 평가 후보 snapshot·권한·멱등성을 검사합니다. Phase 3b는 실제 로컬 OTLP protobuf 전송·큐 포화·export 실패·종료 제한과 실행 결과 보존을 검사합니다. 최신 범위와 제약은 [Phase 3b 구현 현황](docs/implementation/phase-3b.md)에 기록합니다.
+100건 동시 idempotency 접수, schema·상태 전이, 실제 non-superuser RLS, Project 권한, 별도 API·worker 프로세스, 병렬 worker, SIGKILL 복구, stale commit 거부, 취소/dispatch 경합, provider 결과 재사용, SSE 재접속, DLQ redrive 원자성·권한을 검사합니다. Phase 3a는 trace·DRAFT snapshot, Phase 3b는 실제 로컬 OTLP 전송과 유실 경계, Phase 3c는 불변 case·출처·권한과 부작용 없는 모델 판단 비교를 검사합니다. 최신 범위와 제약은 [Phase 3c 구현 현황](docs/implementation/phase-3c.md)에 기록합니다.
 
 ## 설계 문서
 
@@ -83,6 +85,8 @@ docker compose config --quiet
 - [Phase 3a 실행 계획](docs/superpowers/plans/2026-09-14-phase-3a-trace-evaluation.md)
 - [Phase 3b worker OTel·로컬 OTLP 전송](docs/implementation/phase-3b.md)
 - [Phase 3b 실행 계획](docs/superpowers/plans/2026-09-14-phase-3b-worker-otel.md)
+- [Phase 3c 정제 case·mock 모델 판단 회귀 평가](docs/implementation/phase-3c.md)
+- [Phase 3c 실행 계획](docs/superpowers/plans/2026-09-15-phase-3c-offline-evaluation.md)
 - [AI 모델 릴리스 Agent 예제 패키지](examples/ai-model-release/README.md)
 
 ## 이후 달성할 운영 목표
@@ -170,7 +174,8 @@ API와 worker는 같은 Python package를 공유하지만 별도 process로 실�
 - [x] 저장된 Agent/Tool version·schema fingerprint·mock model route 조회
 - [ ] 독립 prompt/runtime build·실 provider model revision 기록
 - [ ] redaction, sampling, retention 정책 구현
-- [ ] 실패 trace를 회귀 평가 데이터셋으로 전환
+- [x] DRAFT 출처에서 명시적으로 정제한 불변 case와 mock 판단 회귀 비교
+- [ ] 독립 검토·승인 데이터셋 승격, 영속 report와 모델 버전 간 회귀 gate
 
 ## 마일스톤
 

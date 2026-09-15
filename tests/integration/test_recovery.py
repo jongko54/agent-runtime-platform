@@ -336,7 +336,7 @@ async def test_migration_requires_active_work_to_be_drained():
             async with engine.connect() as conn:
                 assert (
                     await conn.execute(text("SELECT version_num FROM alembic_version"))
-                ).scalar_one() == "0005"
+                ).scalar_one() == "0006"
                 assert (
                     await conn.execute(text("SELECT status FROM run_attempts"))
                 ).scalar_one() == "RUNNING"

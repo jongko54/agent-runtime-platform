@@ -85,7 +85,7 @@ uv run python -m agent_platform.worker.main
 
 2026-09-14 로컬 전체 **353 tests passed**(기존 272개 + 신규 81개). Ruff format/lint, Pyright, frozen dependency sync, source/wheel build, Compose config와 diff 검사 통과. 독립 리뷰에서 retry exhaustion을 예약으로 오인하는 span 표현과 SDK 전역 metrics 경계를 발견해 수정하고 회귀 테스트를 추가했다. 재리뷰와 집중 100개 단위 테스트에서 추가 차단 문제를 발견하지 못했다. 사용자 DB migration·실제 외부 provider·운영 collector 배포를 수행한 결과는 아니다.
 
-다음 범위는 DRAFT 후보의 검토·정제 입력·expected result·scorer 계약을 정의하고 버전 고정 offline 회귀 평가로 연결하는 것이다. Phase 3a 후보는 여전히 자동 평가·승인된 데이터셋이 아니다. full Run context, sampling/retention, 운영 TLS/auth collector, 실제 provider model/token/cost 계측도 별도 후속 범위다.
+후속 [Phase 3c](phase-3c.md)에서 DRAFT 출처에 정제 입력·expected ToolInvocation을 별도 case로 연결하고 mock 판단의 offline 회귀 비교를 추가했다. Phase 3a 후보 자체는 여전히 자동 평가·승인된 데이터셋이 아니다. full Run context, sampling/retention, 운영 TLS/auth collector, 실제 provider model/token/cost 계측도 별도 후속 범위다.
 
 ## 참고
 

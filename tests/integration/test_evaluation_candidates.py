@@ -497,7 +497,7 @@ async def test_candidate_migration_preserves_source_and_refuses_nonempty_downgra
             async with engine.connect() as conn:
                 assert (
                     await conn.execute(text("SELECT version_num FROM alembic_version"))
-                ).scalar_one() == "0005"
+                ).scalar_one() == "0006"
                 assert (
                     await conn.execute(text("SELECT count(*) FROM evaluation_candidates"))
                 ).scalar_one() == 1

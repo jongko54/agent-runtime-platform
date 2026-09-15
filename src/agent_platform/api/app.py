@@ -12,11 +12,12 @@ from fastapi import Body, Depends, FastAPI, Header, Query, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy.ext.asyncio import AsyncEngine
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from agent_platform.adapters.identity import StaticTokenVerifier
+from agent_platform.adapters.models.mock import MockModelGateway
 from agent_platform.application.errors import (
     ApplicationError,
     AuthenticationRequired,
@@ -29,6 +30,7 @@ from agent_platform.application.errors import (
     ProviderUnavailable,
     RuntimeConflict,
 )
+from agent_platform.application.evaluation import EvaluationRepository, evaluate_cases
 from agent_platform.application.observability import ObservationRepository
 from agent_platform.application.ports import (
     CreateRunCommand,
@@ -106,6 +108,37 @@ class EvaluationCandidateRequest(BaseModel):
     expected_state: Literal["COMPLETED", "FAILED", "CANCELLED", "TIMED_OUT", "REJECTED"]
 
 
+class EvaluationCaseRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    source_snapshot_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
+    input: dict[str, Any]
+    expected_decision: dict[str, Any]
+    review_confirmed: bool = Field(strict=True)
+
+    @field_validator("review_confirmed")
+    @classmethod
+    def require_review(cls, value: bool) -> bool:
+        if not value:
+            raise ValueError("Explicit curation review is required")
+        return value
+
+
+class OfflineEvaluationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    case_ids: list[Annotated[str, Field(min_length=1, max_length=64)]] = Field(
+        min_length=1,
+        max_length=50,
+    )
+    model_revision: Literal["mock/release-planner-v1"] = "mock/release-planner-v1"
+
+    @field_validator("case_ids")
+    @classmethod
+    def require_distinct_cases(cls, values: list[str]) -> list[str]:
+        if len(set(values)) != len(values):
+            raise ValueError("Duplicate cases are not permitted")
+        return values
+
+
 def public_run(run: RunRecord) -> dict[str, Any]:
     return {
         "run_id": run.id,
@@ -149,9 +182,17 @@ def observations_for(request: Request) -> ObservationRepository:
     return observations
 
 
+def evaluations_for(request: Request) -> EvaluationRepository:
+    evaluations = cast(EvaluationRepository | None, request.app.state.evaluations)
+    if evaluations is None:
+        raise ObservationUnavailable()
+    return evaluations
+
+
 Principal = Annotated[PrincipalContext, Depends(authenticate)]
 Repository = Annotated[RunRepository, Depends(repository_for)]
 Observations = Annotated[ObservationRepository, Depends(observations_for)]
+Evaluations = Annotated[EvaluationRepository, Depends(evaluations_for)]
 
 
 def create_app(
@@ -160,6 +201,7 @@ def create_app(
     identity_verifier: IdentityVerifier | None = None,
     tool_gateway: ToolGateway | None = None,
     observations: ObservationRepository | None = None,
+    evaluations: EvaluationRepository | None = None,
 ) -> FastAPI:
     configuration = settings or Settings()
 
@@ -172,6 +214,12 @@ def create_app(
 
             engine = create_engine(configuration.database_url)
             application.state.repository = PostgresRunRepository(engine)
+            if evaluations is None:
+                from agent_platform.adapters.postgres.evaluations import (
+                    PostgresEvaluationRepository,
+                )
+
+                application.state.evaluations = PostgresEvaluationRepository(engine)
             if observations is None:
                 from agent_platform.adapters.postgres.observations import (
                     PostgresObservationRepository,
@@ -196,6 +244,7 @@ def create_app(
     app.state.identity_verifier = identity_verifier
     app.state.tool_gateway = tool_gateway
     app.state.observations = observations
+    app.state.evaluations = evaluations
     if identity_verifier is None and configuration.development_mode:
         secret = configuration.development_token
         if secret is not None and secret.get_secret_value():
@@ -313,6 +362,57 @@ def create_app(
             dict[str, Any],
             jsonable_encoder(asdict(await store.get_evaluation_candidate(principal, candidate_id))),
         )
+
+    @app.post("/v1/evaluation-candidates/{candidate_id}/cases", status_code=201)
+    async def create_evaluation_case(
+        candidate_id: str,
+        body: EvaluationCaseRequest,
+        principal: Principal,
+        store: Evaluations,
+        idempotency_key: Annotated[str, Header(min_length=1, max_length=200)],
+    ) -> JSONResponse:
+        if not idempotency_key.strip():
+            raise InvalidInput("Invalid idempotency key")
+        accepted = await store.create_case(
+            principal,
+            candidate_id,
+            source_snapshot_digest=body.source_snapshot_digest,
+            input=body.input,
+            expected_decision=body.expected_decision,
+            review_confirmed=body.review_confirmed,
+            idempotency_key=idempotency_key,
+        )
+        return JSONResponse(
+            jsonable_encoder(asdict(accepted)),
+            status_code=200 if accepted.duplicate else 201,
+        )
+
+    @app.get("/v1/evaluation-cases/{case_id}")
+    async def get_evaluation_case(
+        case_id: str,
+        principal: Principal,
+        store: Evaluations,
+    ) -> dict[str, Any]:
+        return cast(
+            dict[str, Any], jsonable_encoder(asdict(await store.get_case(principal, case_id)))
+        )
+
+    @app.post("/v1/evaluations/offline")
+    async def evaluate_offline(
+        body: OfflineEvaluationRequest,
+        principal: Principal,
+        store: Evaluations,
+    ) -> dict[str, Any]:
+        cases = await store.get_cases(principal, body.case_ids)
+        report = await evaluate_cases(cases, MockModelGateway(), model_revision=body.model_revision)
+        # No DB transaction spans the model await. Recheck current access before
+        # returning a report, including cases whose membership was revoked mid-call.
+        current = await store.get_cases(principal, body.case_ids)
+        if sorted((case.id, case.content_digest) for case in current) != sorted(
+            (case.id, case.content_digest) for case in cases
+        ):
+            raise RuntimeConflict("Evaluation case set changed")
+        return report
 
     @app.get("/v1/runs/{run_id}/dead-letters")
     async def list_dead_letters(

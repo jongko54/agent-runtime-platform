@@ -504,12 +504,18 @@ class PostgresRunRepository:
             return [EventRecord(**dict(row)) for row in rows]
 
     async def _authorized_run(
-        self, conn: AsyncConnection, principal: PrincipalContext, run_id: str
+        self,
+        conn: AsyncConnection,
+        principal: PrincipalContext,
+        run_id: str,
+        *,
+        metadata_only: bool = False,
     ) -> RowMapping:
+        columns = "id,tenant_id,project_id,agent_version_id" if metadata_only else "*"
         run = (
             (
                 await conn.execute(
-                    text("SELECT * FROM runs WHERE id=:id AND tenant_id=:tenant"),
+                    text(f"SELECT {columns} FROM runs WHERE id=:id AND tenant_id=:tenant"),
                     {"id": run_id, "tenant": principal.tenant_id},
                 )
             )
